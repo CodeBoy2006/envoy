@@ -80,8 +80,17 @@ public:
     return lb.chooseHost(&context).host;
   }
 
+  HostConstSharedPtr chooseKey(LoadBalancer& lb, uint64_t key) {
+    return choose(lb, HashUtil::xxHash64Value(key));
+  }
+
   std::string chooseAddress(LoadBalancer& lb, uint64_t hash) {
     auto host = choose(lb, hash);
+    return host == nullptr ? "" : host->address()->asString();
+  }
+
+  std::string chooseKeyAddress(LoadBalancer& lb, uint64_t key) {
+    auto host = chooseKey(lb, key);
     return host == nullptr ? "" : host->address()->asString();
   }
 
@@ -162,14 +171,14 @@ TEST_F(LrhLoadBalancerTest, MembershipRemovalRebuildsRing) {
   auto before = workerLb();
   std::vector<std::string> assignments_before;
   for (uint64_t key = 0; key < 200; ++key) {
-    assignments_before.push_back(chooseAddress(*before, key));
+    assignments_before.push_back(chooseKeyAddress(*before, key));
   }
 
   setHosts({hosts[0], hosts[1], hosts[2]});
   auto after = workerLb();
   uint64_t changed = 0;
   for (uint64_t key = 0; key < assignments_before.size(); ++key) {
-    const HostConstSharedPtr next_host = choose(*after, key);
+    const HostConstSharedPtr next_host = chooseKey(*after, key);
     ASSERT_NE(nullptr, next_host);
     const std::string next = next_host->address()->asString();
     EXPECT_THAT(next, Not(HasSubstr(":93")));
@@ -193,7 +202,9 @@ TEST_F(LrhLoadBalancerTest, WeightedHostReceivesMoreTraffic) {
   auto lb = workerLb();
   uint64_t heavy = 0;
   for (uint64_t key = 0; key < 1000; ++key) {
-    if (choose(*lb, key) == hosts[0]) {
+    const HostConstSharedPtr host = chooseKey(*lb, key);
+    ASSERT_NE(nullptr, host);
+    if (host->address()->asString() == hosts[0]->address()->asString()) {
       ++heavy;
     }
   }
