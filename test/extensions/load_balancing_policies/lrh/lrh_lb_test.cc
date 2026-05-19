@@ -18,6 +18,7 @@
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/test_runtime.h"
 
+#include "absl/strings/str_cat.h"
 #include "absl/types/optional.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -73,6 +74,15 @@ public:
     host_set_.hosts_ = hosts;
     host_set_.healthy_hosts_ = hosts;
     host_set_.runCallbacks({}, {});
+  }
+
+  HostVector makeWeightedHosts(const std::vector<uint32_t>& weights) {
+    HostVector hosts;
+    hosts.reserve(weights.size());
+    for (size_t i = 0; i < weights.size(); ++i) {
+      hosts.push_back(makeTestHost(info_, absl::StrCat("tcp://127.0.0.1:", 90 + i), weights[i]));
+    }
+    return hosts;
   }
 
   HostConstSharedPtr choose(LoadBalancer& lb, uint64_t hash) {
@@ -209,6 +219,68 @@ TEST_F(LrhLoadBalancerTest, WeightedHostReceivesMoreTraffic) {
     }
   }
   EXPECT_GT(heavy, 650);
+}
+
+TEST_F(LrhLoadBalancerTest, DynamicWeightUpdateKeepsRingTopologyAndMovesTraffic) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(8);
+
+  setHosts(makeWeightedHosts({1, 1, 1, 1}));
+  init();
+  const uint64_t ring_size = lb_->stats().size_.value();
+  const uint64_t min_hashes = lb_->stats().min_hashes_per_host_.value();
+  const uint64_t max_hashes = lb_->stats().max_hashes_per_host_.value();
+
+  auto before_lb = workerLb();
+  std::vector<std::string> before_assignments;
+  before_assignments.reserve(keys);
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*before_lb, key);
+    before_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
+  setHosts(makeWeightedHosts({32, 1, 1, 1}));
+  EXPECT_EQ(ring_size, lb_->stats().size_.value());
+  EXPECT_EQ(min_hashes, lb_->stats().min_hashes_per_host_.value());
+  EXPECT_EQ(max_hashes, lb_->stats().max_hashes_per_host_.value());
+
+  auto after_lb = workerLb();
+  std::vector<std::string> after_assignments;
+  after_assignments.reserve(keys);
+  uint64_t after_heavy = 0;
+  uint64_t changed = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*after_lb, key);
+    after_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++after_heavy;
+    }
+    if (address != before_assignments[key]) {
+      ++changed;
+    }
+  }
+
+  EXPECT_GT(after_heavy, before_heavy * 2);
+  EXPECT_GT(after_heavy, keys * 65 / 100);
+  EXPECT_GT(changed, keys / 4);
+  EXPECT_LT(changed, keys);
+
+  setHosts(makeWeightedHosts({320, 10, 10, 10}));
+  EXPECT_EQ(ring_size, lb_->stats().size_.value());
+  EXPECT_EQ(min_hashes, lb_->stats().min_hashes_per_host_.value());
+  EXPECT_EQ(max_hashes, lb_->stats().max_hashes_per_host_.value());
+
+  auto scaled_lb = workerLb();
+  for (uint64_t key = 0; key < keys; ++key) {
+    EXPECT_EQ(after_assignments[key], chooseKeyAddress(*scaled_lb, key))
+        << "scaled weights changed winner for key " << key;
+  }
 }
 
 TEST_F(LrhLoadBalancerTest, HealthFilteringSkipsUnhealthyHosts) {

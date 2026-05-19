@@ -16,6 +16,9 @@
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/test_common/simulated_time_system.h"
 
+#include "absl/container/node_hash_map.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
 #include "benchmark/benchmark.h"
 
@@ -71,7 +74,11 @@ public:
 
 inline void computeHitStats(::benchmark::State& state,
                             const absl::node_hash_map<std::string, uint64_t>& hit_counter,
-                            absl::optional<uint64_t> expected_hosts = absl::nullopt) {
+                            absl::optional<uint64_t> expected_hosts = absl::nullopt,
+                            absl::string_view counter_prefix = "") {
+  const auto counter_name = [counter_prefix](absl::string_view name) -> std::string {
+    return counter_prefix.empty() ? std::string(name) : absl::StrCat(counter_prefix, name);
+  };
   const uint64_t observed_hosts = hit_counter.size();
   const uint64_t host_count =
       std::max<uint64_t>(expected_hosts.value_or(observed_hosts), observed_hosts);
@@ -81,20 +88,20 @@ inline void computeHitStats(::benchmark::State& state,
   }
 
   if (host_count == 0) {
-    state.counters["active_hosts"] = 0;
-    state.counters["host_count"] = 0;
-    state.counters["total_hits"] = 0;
-    state.counters["mean_hits"] = 0;
-    state.counters["stddev_hits"] = 0;
-    state.counters["relative_stddev_hits"] = 0;
-    state.counters["cv_hits"] = 0;
-    state.counters["min_hits"] = 0;
-    state.counters["max_hits"] = 0;
-    state.counters["min_over_avg"] = 0;
-    state.counters["max_over_avg"] = 0;
-    state.counters["p50_over_avg"] = 0;
-    state.counters["p95_over_avg"] = 0;
-    state.counters["p99_over_avg"] = 0;
+    state.counters[counter_name("active_hosts")] = 0;
+    state.counters[counter_name("host_count")] = 0;
+    state.counters[counter_name("total_hits")] = 0;
+    state.counters[counter_name("mean_hits")] = 0;
+    state.counters[counter_name("stddev_hits")] = 0;
+    state.counters[counter_name("relative_stddev_hits")] = 0;
+    state.counters[counter_name("cv_hits")] = 0;
+    state.counters[counter_name("min_hits")] = 0;
+    state.counters[counter_name("max_hits")] = 0;
+    state.counters[counter_name("min_over_avg")] = 0;
+    state.counters[counter_name("max_over_avg")] = 0;
+    state.counters[counter_name("p50_over_avg")] = 0;
+    state.counters[counter_name("p95_over_avg")] = 0;
+    state.counters[counter_name("p99_over_avg")] = 0;
     return;
   }
 
@@ -128,20 +135,20 @@ inline void computeHitStats(::benchmark::State& state,
     return hits[index];
   };
 
-  state.counters["active_hosts"] = observed_hosts;
-  state.counters["host_count"] = host_count;
-  state.counters["total_hits"] = total_hits;
-  state.counters["mean_hits"] = mean;
-  state.counters["stddev_hits"] = stddev;
-  state.counters["relative_stddev_hits"] = cv;
-  state.counters["cv_hits"] = cv;
-  state.counters["min_hits"] = min_hits;
-  state.counters["max_hits"] = max_hits;
-  state.counters["min_over_avg"] = mean > 0 ? min_hits / mean : 0;
-  state.counters["max_over_avg"] = mean > 0 ? max_hits / mean : 0;
-  state.counters["p50_over_avg"] = mean > 0 ? percentile(0.50) / mean : 0;
-  state.counters["p95_over_avg"] = mean > 0 ? percentile(0.95) / mean : 0;
-  state.counters["p99_over_avg"] = mean > 0 ? percentile(0.99) / mean : 0;
+  state.counters[counter_name("active_hosts")] = observed_hosts;
+  state.counters[counter_name("host_count")] = host_count;
+  state.counters[counter_name("total_hits")] = total_hits;
+  state.counters[counter_name("mean_hits")] = mean;
+  state.counters[counter_name("stddev_hits")] = stddev;
+  state.counters[counter_name("relative_stddev_hits")] = cv;
+  state.counters[counter_name("cv_hits")] = cv;
+  state.counters[counter_name("min_hits")] = min_hits;
+  state.counters[counter_name("max_hits")] = max_hits;
+  state.counters[counter_name("min_over_avg")] = mean > 0 ? min_hits / mean : 0;
+  state.counters[counter_name("max_over_avg")] = mean > 0 ? max_hits / mean : 0;
+  state.counters[counter_name("p50_over_avg")] = mean > 0 ? percentile(0.50) / mean : 0;
+  state.counters[counter_name("p95_over_avg")] = mean > 0 ? percentile(0.95) / mean : 0;
+  state.counters[counter_name("p99_over_avg")] = mean > 0 ? percentile(0.99) / mean : 0;
 }
 
 inline uint64_t hashInt(uint64_t i) {
