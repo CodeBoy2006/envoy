@@ -1,5 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
@@ -12,6 +17,8 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/load_balancing_policies/common/thread_aware_lb_impl.h"
+
+#include "absl/types/span.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -60,6 +67,8 @@ public:
   const LrhLoadBalancerStats& stats() const { return stats_; }
 
   static LrhLoadBalancerStats generateStats(Stats::Scope& scope);
+  bool updateWeightsForTest(absl::Span<const double> effective_weights_by_host);
+  bool updateHostWeightsForTest(absl::Span<const std::pair<uint32_t, double>> weight_updates);
 
   static constexpr uint32_t DefaultCandidateCount = 8;
   static constexpr uint32_t MaxCandidateCount = 64;
@@ -69,30 +78,61 @@ public:
 private:
   struct RingEntry {
     uint64_t hash_;
-    HostConstSharedPtr host_;
-    double normalized_weight_;
-    uint64_t host_hash_;
+    uint32_t host_index_;
   };
 
   class Ring : public HashingLoadBalancer {
   public:
+    struct Topology;
+    using TopologySharedPtr = std::shared_ptr<const Topology>;
+
     Ring(const NormalizedHostWeightVector& normalized_host_weights, double min_normalized_weight,
          uint64_t min_ring_size, uint64_t max_ring_size, uint32_t candidate_count,
-         bool deduplicate_hosts, bool use_hostname_for_hashing, LrhLoadBalancerStats& stats);
+         bool deduplicate_hosts, bool use_hostname_for_hashing, TopologySharedPtr cached_topology,
+         LrhLoadBalancerStats& stats);
 
     // ThreadAwareLoadBalancerBase::HashingLoadBalancer
     HostSelectionResponse chooseHost(uint64_t hash, uint32_t attempt) const override;
 
-    size_t ringSizeForTest() const { return ring_.size(); }
+    size_t ringSizeForTest() const { return ring_->size(); }
     size_t candidateCountForTest() const { return candidate_count_; }
+    TopologySharedPtr topology() const { return topology_; }
+    bool updateWeightsForTest(absl::Span<const double> effective_weights_by_host);
+    bool updateHostWeightsForTest(absl::Span<const std::pair<uint32_t, double>> weight_updates);
 
   private:
-    size_t lowerBound(uint64_t hash) const;
-    const RingEntry* bestInCandidateBlock(uint64_t hash, size_t start, size_t max_slots,
-                                          size_t& walked) const;
-    static double weightedScore(uint64_t request_hash, const RingEntry& entry);
+    struct HostState {
+      HostState(HostConstSharedPtr host, uint64_t host_hash, double effective_weight)
+          : host_(std::move(host)), host_hash_(host_hash), effective_weight_(effective_weight) {}
 
-    std::vector<RingEntry> ring_;
+      HostConstSharedPtr host_;
+      uint64_t host_hash_;
+      std::atomic<double> effective_weight_;
+    };
+    using HostStateSharedPtr = std::shared_ptr<HostState>;
+
+    struct InitialHostState {
+      HostConstSharedPtr host_;
+      std::string hash_key_;
+      uint64_t host_hash_;
+      double effective_weight_;
+    };
+
+    static constexpr double MinEffectiveWeight = std::numeric_limits<double>::min();
+
+    size_t lowerBound(uint64_t hash) const;
+    const HostState* bestInCandidateBlock(uint64_t hash, size_t start, size_t max_slots,
+                                          size_t& walked) const;
+    static double weightedScore(uint64_t request_hash, const HostState& host_state);
+    static TopologySharedPtr buildTopology(const std::vector<InitialHostState>& host_states,
+                                           uint64_t min_ring_size, uint64_t max_ring_size);
+    static bool topologyMatches(const Topology& topology,
+                                const std::vector<InitialHostState>& host_states);
+    static double sanitizeWeight(double effective_weight);
+
+    TopologySharedPtr topology_;
+    const std::vector<RingEntry>* ring_{};
+    std::vector<HostStateSharedPtr> host_states_;
     const uint32_t candidate_count_;
     const bool deduplicate_hosts_;
     LrhLoadBalancerStats& stats_;
@@ -111,6 +151,8 @@ private:
   const bool deduplicate_hosts_;
   const bool use_hostname_for_hashing_;
   const uint32_t hash_balance_factor_;
+  Ring::TopologySharedPtr cached_topology_;
+  std::weak_ptr<Ring> latest_ring_for_test_;
 };
 
 } // namespace Upstream

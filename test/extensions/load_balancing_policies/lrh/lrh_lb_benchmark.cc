@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "source/extensions/load_balancing_policies/lrh/lrh_lb.h"
@@ -132,6 +133,39 @@ uint32_t weightForEpoch(uint64_t epoch, uint32_t max_weight, uint32_t pattern) {
     return epoch % 2 == 0 ? 1 : max_weight;
   }
   return max_weight;
+}
+
+std::vector<std::vector<std::pair<uint32_t, double>>>
+directWeightUpdatesByEpoch(uint64_t num_hosts, uint32_t epochs, uint32_t weighted_subset_percent,
+                           uint32_t max_weight, uint32_t pattern) {
+  const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
+  const double base_weight = 1.0 / static_cast<double>(num_hosts);
+  std::vector<double> current_weights(num_hosts, base_weight);
+  std::vector<std::vector<std::pair<uint32_t, double>>> updates_by_epoch;
+  updates_by_epoch.reserve(epochs);
+
+  for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
+    const uint32_t weight = weightForEpoch(epoch, max_weight, pattern);
+    const uint64_t weighted_subset_offset =
+        weightedSubsetOffsetForEpoch(epoch, num_hosts, weighted_hosts, pattern);
+    std::vector<std::pair<uint32_t, double>> updates;
+
+    for (uint64_t i = 0; i < num_hosts; ++i) {
+      const uint64_t offset_index =
+          (i + num_hosts - (weighted_subset_offset % num_hosts)) % num_hosts;
+      const bool should_weight = offset_index < weighted_hosts;
+      const double target_weight = static_cast<double>(should_weight ? weight : 1) * base_weight;
+      if (current_weights[i] != target_weight) {
+        ASSERT(i <= std::numeric_limits<uint32_t>::max());
+        updates.push_back({static_cast<uint32_t>(i), target_weight});
+        current_weights[i] = target_weight;
+      }
+    }
+
+    updates_by_epoch.push_back(std::move(updates));
+  }
+
+  return updates_by_epoch;
 }
 
 bool isWeightedSubsetAddress(const absl::flat_hash_set<std::string>& weighted_subset_addresses,
@@ -284,6 +318,11 @@ void recordSequenceStats(::benchmark::State& state, uint64_t num_hosts, uint32_t
   state.counters["pattern"] = pattern;
   state.counters["update_ms_avg"] = update_ms_total / epochs;
   state.counters["lookup_ms_avg"] = lookup_ms_total / epochs;
+  state.counters["update_epochs_per_second"] =
+      update_ms_total > 0 ? 1000.0 * epochs / update_ms_total : 0.0;
+  state.counters["full_epochs_per_second"] =
+      update_ms_total + lookup_ms_total > 0 ? 1000.0 * epochs / (update_ms_total + lookup_ms_total)
+                                            : 0.0;
   state.counters["update_to_lookup_ms_ratio"] =
       lookup_ms_total > 0 ? update_ms_total / lookup_ms_total : 0.0;
   state.counters["changed_avg_percent"] = changed_percent_total / comparable_transitions;
@@ -776,6 +815,135 @@ void benchmarkLrhLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
   }
 }
 BENCHMARK(benchmarkLrhLoadBalancerWeightUpdateSequence)
+    ->Args({100, 65536, 8, 20, 10000, 10, 32, 0})
+    ->Args({100, 65536, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 8, 20, 10000, 10, 32, 0})
+    ->Args({500, 65536, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 256000, 8, 20, 10000, 10, 32, 0})
+    ->Args({500, 256000, 8, 20, 10000, 10, 32, 1})
+    ->Unit(::benchmark::kMillisecond);
+
+void benchmarkLrhLoadBalancerDirectWeightUpdateSequence(::benchmark::State& state) {
+  for (auto _ : state) { // NOLINT: Silences warning about dead store
+    state.PauseTiming();
+    const uint64_t num_hosts = state.range(0);
+    const uint64_t min_ring_size = state.range(1);
+    const uint32_t candidate_count = state.range(2);
+    const uint32_t epochs = state.range(3);
+    const uint64_t keys_per_epoch = state.range(4);
+    const uint32_t weighted_subset_percent = state.range(5);
+    const uint32_t max_weight = state.range(6);
+    const uint32_t pattern = state.range(7);
+    const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
+    const auto updates_by_epoch =
+        directWeightUpdatesByEpoch(num_hosts, epochs, weighted_subset_percent, max_weight, pattern);
+
+    LrhTester tester(num_hosts, min_ring_size, candidate_count);
+    ASSERT_TRUE(tester.lrh_lb_->initialize().ok());
+    LoadBalancerPtr lb = tester.lrh_lb_->factory()->create(tester.lb_params_);
+    std::vector<std::string> previous_assignments;
+    previous_assignments.reserve(keys_per_epoch);
+    SlotStats previous_slots{tester.lrh_lb_->stats().size_.value(),
+                             tester.lrh_lb_->stats().min_hashes_per_host_.value(),
+                             tester.lrh_lb_->stats().max_hashes_per_host_.value()};
+
+    double update_ms_total = 0.0;
+    double lookup_ms_total = 0.0;
+    double changed_percent_total = 0.0;
+    double changed_percent_max = 0.0;
+    double weighted_subset_percent_total = 0.0;
+    double target_error_percent_total = 0.0;
+    double cv_total = 0.0;
+    double max_over_avg_total = 0.0;
+    double p99_over_avg_total = 0.0;
+    double slot_shape_change_epochs = 0.0;
+    double slots_delta_abs_total = 0.0;
+    double min_slots_delta_abs_total = 0.0;
+    double max_slots_delta_abs_total = 0.0;
+    double weight_updates_total = 0.0;
+
+    state.ResumeTiming();
+    for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
+      const uint32_t weight = weightForEpoch(epoch, max_weight, pattern);
+      const uint64_t weighted_subset_offset =
+          weightedSubsetOffsetForEpoch(epoch, num_hosts, weighted_hosts, pattern);
+
+      const auto update_start = std::chrono::steady_clock::now();
+      ASSERT_TRUE(tester.lrh_lb_->updateHostWeightsForTest(updates_by_epoch[epoch]));
+      const auto update_end = std::chrono::steady_clock::now();
+      update_ms_total +=
+          std::chrono::duration<double, std::milli>(update_end - update_start).count();
+      weight_updates_total += updates_by_epoch[epoch].size();
+
+      const SlotStats current_slots{tester.lrh_lb_->stats().size_.value(),
+                                    tester.lrh_lb_->stats().min_hashes_per_host_.value(),
+                                    tester.lrh_lb_->stats().max_hashes_per_host_.value()};
+      const int64_t slots_delta =
+          static_cast<int64_t>(current_slots.slots) - static_cast<int64_t>(previous_slots.slots);
+      const int64_t min_slots_delta = static_cast<int64_t>(current_slots.min_slots_per_host) -
+                                      static_cast<int64_t>(previous_slots.min_slots_per_host);
+      const int64_t max_slots_delta = static_cast<int64_t>(current_slots.max_slots_per_host) -
+                                      static_cast<int64_t>(previous_slots.max_slots_per_host);
+      slots_delta_abs_total += std::abs(slots_delta);
+      min_slots_delta_abs_total += std::abs(min_slots_delta);
+      max_slots_delta_abs_total += std::abs(max_slots_delta);
+      if (slots_delta != 0 || min_slots_delta != 0 || max_slots_delta != 0) {
+        slot_shape_change_epochs += 1.0;
+      }
+      previous_slots = current_slots;
+
+      const auto weighted_addresses =
+          weightedSubsetAddresses(tester, weighted_hosts, weighted_subset_offset);
+      absl::node_hash_map<std::string, uint64_t> hit_counter;
+      std::vector<std::string> assignments;
+      assignments.reserve(keys_per_epoch);
+      uint64_t weighted_subset_hits = 0;
+      uint64_t changed_assignments = 0;
+
+      const auto lookup_start = std::chrono::steady_clock::now();
+      collectChoices(*lb, *tester.hash_policy_, keys_per_epoch, weighted_addresses, hit_counter,
+                     &assignments, weighted_subset_hits,
+                     previous_assignments.empty() ? nullptr : &previous_assignments,
+                     previous_assignments.empty() ? nullptr : &changed_assignments);
+      const auto lookup_end = std::chrono::steady_clock::now();
+      lookup_ms_total +=
+          std::chrono::duration<double, std::milli>(lookup_end - lookup_start).count();
+
+      if (!previous_assignments.empty()) {
+        const double changed_percent =
+            100.0 * changed_assignments / static_cast<double>(keys_per_epoch);
+        changed_percent_total += changed_percent;
+        changed_percent_max = std::max(changed_percent_max, changed_percent);
+      }
+      previous_assignments = std::move(assignments);
+
+      const double epoch_weighted_percent =
+          100.0 * weighted_subset_hits / static_cast<double>(keys_per_epoch);
+      weighted_subset_percent_total += epoch_weighted_percent;
+      target_error_percent_total +=
+          std::abs(epoch_weighted_percent -
+                   weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, weight));
+      const HitDistributionStats hit_stats = summarizeHitDistribution(hit_counter, num_hosts);
+      cv_total += hit_stats.cv;
+      max_over_avg_total += hit_stats.max_over_avg;
+      p99_over_avg_total += hit_stats.p99_over_avg;
+    }
+    state.PauseTiming();
+
+    recordSequenceStats(state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent,
+                        max_weight, pattern, weighted_hosts, update_ms_total, lookup_ms_total,
+                        changed_percent_total, changed_percent_max, weighted_subset_percent_total,
+                        target_error_percent_total, cv_total, max_over_avg_total,
+                        p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
+                        min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
+    state.counters["direct_weight_table_update"] = 1;
+    state.counters["weight_updates_avg"] = weight_updates_total / epochs;
+    state.counters["weight_updates_per_second"] =
+        update_ms_total > 0 ? 1000.0 * weight_updates_total / update_ms_total : 0.0;
+    state.ResumeTiming();
+  }
+}
+BENCHMARK(benchmarkLrhLoadBalancerDirectWeightUpdateSequence)
     ->Args({100, 65536, 8, 20, 10000, 10, 32, 0})
     ->Args({100, 65536, 8, 20, 10000, 10, 32, 1})
     ->Args({500, 65536, 8, 20, 10000, 10, 32, 0})

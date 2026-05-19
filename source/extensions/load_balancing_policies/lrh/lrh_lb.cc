@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,6 +20,13 @@
 
 namespace Envoy {
 namespace Upstream {
+
+struct LrhLoadBalancer::Ring::Topology {
+  std::vector<RingEntry> ring_;
+  std::vector<std::string> host_keys_;
+  uint64_t min_hashes_per_host_{0};
+  uint64_t max_hashes_per_host_{0};
+};
 
 TypedLrhLbConfig::TypedLrhLbConfig(const LrhLbProto& lb_config, Regex::Engine& regex_engine,
                                    absl::Status& creation_status)
@@ -57,9 +65,13 @@ ThreadAwareLoadBalancerBase::HashingLoadBalancerSharedPtr
 LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
                                     double min_normalized_weight,
                                     double /* max_normalized_weight */) {
-  HashingLoadBalancerSharedPtr lrh_lb = std::make_shared<Ring>(
-      normalized_host_weights, min_normalized_weight, min_ring_size_, max_ring_size_,
-      candidate_count_, deduplicate_hosts_, use_hostname_for_hashing_, stats_);
+  auto ring = std::make_shared<Ring>(normalized_host_weights, min_normalized_weight, min_ring_size_,
+                                     max_ring_size_, candidate_count_, deduplicate_hosts_,
+                                     use_hostname_for_hashing_, cached_topology_, stats_);
+  cached_topology_ = ring->topology();
+  latest_ring_for_test_ = ring;
+
+  HashingLoadBalancerSharedPtr lrh_lb = ring;
 
   if (hash_balance_factor_ == 0) {
     return lrh_lb;
@@ -73,42 +85,58 @@ LrhLoadBalancerStats LrhLoadBalancer::generateStats(Stats::Scope& scope) {
   return {ALL_LRH_LOAD_BALANCER_STATS(POOL_GAUGE(scope))};
 }
 
-size_t LrhLoadBalancer::Ring::lowerBound(uint64_t hash) const {
-  auto it =
-      std::lower_bound(ring_.begin(), ring_.end(), hash,
-                       [](const RingEntry& entry, uint64_t value) { return entry.hash_ < value; });
-  if (it == ring_.end()) {
-    return 0;
-  }
-  return std::distance(ring_.begin(), it);
+bool LrhLoadBalancer::updateWeightsForTest(absl::Span<const double> effective_weights_by_host) {
+  auto ring = latest_ring_for_test_.lock();
+  return ring != nullptr && ring->updateWeightsForTest(effective_weights_by_host);
 }
 
-double LrhLoadBalancer::Ring::weightedScore(uint64_t request_hash, const RingEntry& entry) {
-  const uint64_t score_hash = HashUtil::xxHash64Value(request_hash, entry.host_hash_);
+bool LrhLoadBalancer::updateHostWeightsForTest(
+    absl::Span<const std::pair<uint32_t, double>> weight_updates) {
+  auto ring = latest_ring_for_test_.lock();
+  return ring != nullptr && ring->updateHostWeightsForTest(weight_updates);
+}
+
+size_t LrhLoadBalancer::Ring::lowerBound(uint64_t hash) const {
+  auto it =
+      std::lower_bound(ring_->begin(), ring_->end(), hash,
+                       [](const RingEntry& entry, uint64_t value) { return entry.hash_ < value; });
+  if (it == ring_->end()) {
+    return 0;
+  }
+  return std::distance(ring_->begin(), it);
+}
+
+double LrhLoadBalancer::Ring::sanitizeWeight(double effective_weight) {
+  return std::max(effective_weight, MinEffectiveWeight);
+}
+
+double LrhLoadBalancer::Ring::weightedScore(uint64_t request_hash, const HostState& host_state) {
+  const uint64_t score_hash = HashUtil::xxHash64Value(request_hash, host_state.host_hash_);
 
   // Map to (0, 1] and use exponential-race scoring. Lower scores win.
   const double u = (static_cast<double>(score_hash) + 1.0) /
                    (static_cast<double>(std::numeric_limits<uint64_t>::max()) + 1.0);
-  return -std::log(u) / entry.normalized_weight_;
+  return -std::log(u) / host_state.effective_weight_.load(std::memory_order_relaxed);
 }
 
-const LrhLoadBalancer::RingEntry*
+const LrhLoadBalancer::Ring::HostState*
 LrhLoadBalancer::Ring::bestInCandidateBlock(uint64_t hash, size_t start, size_t max_slots,
                                             size_t& walked) const {
-  ASSERT(!ring_.empty());
+  ASSERT(!ring_->empty());
 
-  const RingEntry* best = nullptr;
+  const HostState* best = nullptr;
   double best_score = std::numeric_limits<double>::infinity();
   absl::InlinedVector<const Host*, MaxCandidateCount> seen_hosts;
 
   size_t candidates = 0;
   walked = 0;
   while (walked < max_slots && candidates < candidate_count_) {
-    const RingEntry& entry = ring_[(start + walked) % ring_.size()];
+    const RingEntry& entry = (*ring_)[(start + walked) % ring_->size()];
+    const HostState& host_state = *host_states_[entry.host_index_];
     ++walked;
 
     if (deduplicate_hosts_) {
-      const Host* host = entry.host_.get();
+      const Host* host = host_state.host_.get();
       if (std::find(seen_hosts.begin(), seen_hosts.end(), host) != seen_hosts.end()) {
         continue;
       }
@@ -116,9 +144,9 @@ LrhLoadBalancer::Ring::bestInCandidateBlock(uint64_t hash, size_t start, size_t 
     }
     ++candidates;
 
-    const double score = weightedScore(hash, entry);
+    const double score = weightedScore(hash, host_state);
     if (score < best_score) {
-      best = &entry;
+      best = &host_state;
       best_score = score;
     }
   }
@@ -127,17 +155,17 @@ LrhLoadBalancer::Ring::bestInCandidateBlock(uint64_t hash, size_t start, size_t 
 }
 
 HostSelectionResponse LrhLoadBalancer::Ring::chooseHost(uint64_t hash, uint32_t attempt) const {
-  if (ring_.empty()) {
+  if (ring_->empty()) {
     return {nullptr};
   }
 
-  const size_t ring_size = ring_.size();
+  const size_t ring_size = ring_->size();
   size_t start = (lowerBound(hash) + static_cast<size_t>(attempt) * candidate_count_) % ring_size;
   size_t remaining = ring_size;
 
   while (remaining > 0) {
     size_t walked = 0;
-    const RingEntry* best = bestInCandidateBlock(hash, start, remaining, walked);
+    const HostState* best = bestInCandidateBlock(hash, start, remaining, walked);
     if (best != nullptr) {
       return {best->host_};
     }
@@ -151,23 +179,87 @@ HostSelectionResponse LrhLoadBalancer::Ring::chooseHost(uint64_t hash, uint32_t 
   return {nullptr};
 }
 
+bool LrhLoadBalancer::Ring::updateWeightsForTest(
+    absl::Span<const double> effective_weights_by_host) {
+  if (effective_weights_by_host.size() != host_states_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < effective_weights_by_host.size(); ++i) {
+    host_states_[i]->effective_weight_.store(sanitizeWeight(effective_weights_by_host[i]),
+                                             std::memory_order_relaxed);
+  }
+  return true;
+}
+
+bool LrhLoadBalancer::Ring::updateHostWeightsForTest(
+    absl::Span<const std::pair<uint32_t, double>> weight_updates) {
+  for (const auto& update : weight_updates) {
+    if (update.first >= host_states_.size()) {
+      return false;
+    }
+  }
+  for (const auto& update : weight_updates) {
+    host_states_[update.first]->effective_weight_.store(sanitizeWeight(update.second),
+                                                        std::memory_order_relaxed);
+  }
+  return true;
+}
+
 LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_weights,
                             double /* min_normalized_weight */, uint64_t min_ring_size,
                             uint64_t max_ring_size, uint32_t candidate_count,
                             bool deduplicate_hosts, bool use_hostname_for_hashing,
-                            LrhLoadBalancerStats& stats)
+                            TopologySharedPtr cached_topology, LrhLoadBalancerStats& stats)
     : candidate_count_(candidate_count), deduplicate_hosts_(deduplicate_hosts), stats_(stats) {
-  ENVOY_LOG(trace, "lrh: building ring");
+  std::vector<InitialHostState> initial_host_states;
+  initial_host_states.reserve(normalized_host_weights.size());
+  host_states_.reserve(normalized_host_weights.size());
 
-  if (normalized_host_weights.empty()) {
-    return;
+  for (const auto& entry : normalized_host_weights) {
+    const auto& host = entry.first;
+    const double effective_weight = sanitizeWeight(entry.second);
+    const absl::string_view key_to_hash = hashKey(host, use_hostname_for_hashing);
+    ASSERT(!key_to_hash.empty());
+    const std::string hash_key(key_to_hash);
+    const uint64_t host_hash = HashUtil::xxHash64(hash_key);
+
+    initial_host_states.push_back({host, hash_key, host_hash, effective_weight});
+    host_states_.push_back(std::make_shared<HostState>(host, host_hash, effective_weight));
   }
 
-  const double scale = std::min(std::max(static_cast<double>(min_ring_size),
-                                         static_cast<double>(normalized_host_weights.size())),
-                                static_cast<double>(max_ring_size));
+  if (cached_topology != nullptr && topologyMatches(*cached_topology, initial_host_states)) {
+    topology_ = std::move(cached_topology);
+  } else {
+    ENVOY_LOG(trace, "lrh: building ring topology");
+    topology_ = buildTopology(initial_host_states, min_ring_size, max_ring_size);
+  }
+  ring_ = &topology_->ring_;
+
+  stats_.size_.set(topology_->ring_.size());
+  stats_.min_hashes_per_host_.set(topology_->min_hashes_per_host_);
+  stats_.max_hashes_per_host_.set(topology_->max_hashes_per_host_);
+}
+
+LrhLoadBalancer::Ring::TopologySharedPtr
+LrhLoadBalancer::Ring::buildTopology(const std::vector<InitialHostState>& host_states,
+                                     uint64_t min_ring_size, uint64_t max_ring_size) {
+  auto topology = std::make_shared<Topology>();
+  topology->host_keys_.reserve(host_states.size());
+  for (const auto& host_state : host_states) {
+    topology->host_keys_.push_back(host_state.hash_key_);
+  }
+
+  if (host_states.empty()) {
+    return topology;
+  }
+
+  ASSERT(host_states.size() <= std::numeric_limits<uint32_t>::max());
+
+  const double scale = std::min(
+      std::max(static_cast<double>(min_ring_size), static_cast<double>(host_states.size())),
+      static_cast<double>(max_ring_size));
   const uint64_t ring_size = std::ceil(scale);
-  ring_.reserve(ring_size);
+  topology->ring_.reserve(ring_size);
 
   absl::InlinedVector<char, 196> hash_key_buffer;
   double current_hashes = 0.0;
@@ -175,21 +267,17 @@ LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_we
   uint64_t min_hashes_per_host = ring_size;
   uint64_t max_hashes_per_host = 0;
 
-  for (const auto& entry : normalized_host_weights) {
-    const auto& host = entry.first;
-    const double normalized_weight = std::max(entry.second, std::numeric_limits<double>::min());
-    const absl::string_view key_to_hash = hashKey(host, use_hostname_for_hashing);
-    ASSERT(!key_to_hash.empty());
-    const uint64_t host_hash = HashUtil::xxHash64(key_to_hash);
+  for (uint32_t host_index = 0; host_index < host_states.size(); ++host_index) {
+    const auto& host_state = host_states[host_index];
 
-    hash_key_buffer.assign(key_to_hash.begin(), key_to_hash.end());
+    hash_key_buffer.assign(host_state.hash_key_.begin(), host_state.hash_key_.end());
     hash_key_buffer.emplace_back('_');
     auto offset_start = hash_key_buffer.end();
 
     // LRH keeps the ring topology stable and applies dynamic capacity only
     // inside the local rendezvous election, so each host receives equal token
     // share regardless of its current load-balancing weight.
-    target_hashes += scale / normalized_host_weights.size();
+    target_hashes += scale / host_states.size();
     uint64_t hashes_for_host = 0;
     while (current_hashes < target_hashes) {
       const std::string salt = absl::StrCat("", hashes_for_host);
@@ -197,7 +285,7 @@ LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_we
 
       absl::string_view hash_key(static_cast<char*>(hash_key_buffer.data()),
                                  hash_key_buffer.size());
-      ring_.push_back({HashUtil::xxHash64(hash_key), host, normalized_weight, host_hash});
+      topology->ring_.push_back({HashUtil::xxHash64(hash_key), host_index});
 
       ++hashes_for_host;
       ++current_hashes;
@@ -208,13 +296,26 @@ LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_we
     max_hashes_per_host = std::max(hashes_for_host, max_hashes_per_host);
   }
 
-  std::sort(ring_.begin(), ring_.end(), [](const RingEntry& lhs, const RingEntry& rhs) -> bool {
-    return lhs.hash_ < rhs.hash_;
-  });
+  std::sort(
+      topology->ring_.begin(), topology->ring_.end(),
+      [](const RingEntry& lhs, const RingEntry& rhs) -> bool { return lhs.hash_ < rhs.hash_; });
 
-  stats_.size_.set(ring_.size());
-  stats_.min_hashes_per_host_.set(min_hashes_per_host);
-  stats_.max_hashes_per_host_.set(max_hashes_per_host);
+  topology->min_hashes_per_host_ = min_hashes_per_host;
+  topology->max_hashes_per_host_ = max_hashes_per_host;
+  return topology;
+}
+
+bool LrhLoadBalancer::Ring::topologyMatches(const Topology& topology,
+                                            const std::vector<InitialHostState>& host_states) {
+  if (topology.host_keys_.size() != host_states.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < host_states.size(); ++i) {
+    if (topology.host_keys_[i] != host_states[i].hash_key_) {
+      return false;
+    }
+  }
+  return true;
 }
 
 } // namespace Upstream

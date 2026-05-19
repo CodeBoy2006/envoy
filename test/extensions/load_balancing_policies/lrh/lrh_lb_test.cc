@@ -283,6 +283,66 @@ TEST_F(LrhLoadBalancerTest, DynamicWeightUpdateKeepsRingTopologyAndMovesTraffic)
   }
 }
 
+TEST_F(LrhLoadBalancerTest, DirectWeightTableUpdateMovesTrafficWithoutRefresh) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(8);
+
+  setHosts(makeWeightedHosts({1, 1, 1, 1}));
+  init();
+  const uint64_t ring_size = lb_->stats().size_.value();
+  const uint64_t min_hashes = lb_->stats().min_hashes_per_host_.value();
+  const uint64_t max_hashes = lb_->stats().max_hashes_per_host_.value();
+  const double base_weight = 1.0 / 4.0;
+
+  auto lb = workerLb();
+  std::vector<std::string> before_assignments;
+  before_assignments.reserve(keys);
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*lb, key);
+    before_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
+  const std::vector<std::pair<uint32_t, double>> updates{{0, 32.0 * base_weight}};
+  ASSERT_TRUE(lb_->updateHostWeightsForTest(updates));
+  EXPECT_EQ(ring_size, lb_->stats().size_.value());
+  EXPECT_EQ(min_hashes, lb_->stats().min_hashes_per_host_.value());
+  EXPECT_EQ(max_hashes, lb_->stats().max_hashes_per_host_.value());
+
+  std::vector<std::string> after_assignments;
+  after_assignments.reserve(keys);
+  uint64_t after_heavy = 0;
+  uint64_t changed = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*lb, key);
+    after_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++after_heavy;
+    }
+    if (address != before_assignments[key]) {
+      ++changed;
+    }
+  }
+
+  EXPECT_GT(after_heavy, before_heavy * 2);
+  EXPECT_GT(after_heavy, keys * 65 / 100);
+  EXPECT_GT(changed, keys / 4);
+  EXPECT_LT(changed, keys);
+
+  const std::vector<double> scaled_weights{320.0 * base_weight, 10.0 * base_weight,
+                                           10.0 * base_weight, 10.0 * base_weight};
+  ASSERT_TRUE(lb_->updateWeightsForTest(scaled_weights));
+  for (uint64_t key = 0; key < keys; ++key) {
+    EXPECT_EQ(after_assignments[key], chooseKeyAddress(*lb, key))
+        << "scaled direct weights changed winner for key " << key;
+  }
+}
+
 TEST_F(LrhLoadBalancerTest, HealthFilteringSkipsUnhealthyHosts) {
   HostVector hosts = {
       makeTestHost(info_, "tcp://127.0.0.1:90"), makeTestHost(info_, "tcp://127.0.0.1:91"),
