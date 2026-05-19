@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package envoy.extensions.load_balancing_policies.lrh.v3;
+
+import "envoy/extensions/load_balancing_policies/common/v3/common.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.load_balancing_policies.lrh.v3";
+option java_outer_classname = "LrhProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/lrh/v3;lrhv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Local Rendezvous Hashing Load Balancing Policy]
+// [#extension: envoy.load_balancing_policies.lrh]
+
+// Local Rendezvous Hashing (LRH) keeps a stable host-token ring, scans a small
+// contiguous local candidate window for each request hash, and selects the
+// candidate with the best weighted rendezvous score.
+// [#next-free-field: 7]
+message LocalRendezvousHashing {
+  // Number of local ring slots to score per request. Defaults to 8.
+  google.protobuf.UInt32Value candidate_count = 1
+      [(validate.rules).uint32 = {lte: 64 gte: 1}];
+
+  // Minimum hash ring size. Defaults to 1024 entries and is limited to 8M entries.
+  google.protobuf.UInt64Value minimum_ring_size = 2
+      [(validate.rules).uint64 = {lte: 8388608 gte: 1}];
+
+  // Maximum hash ring size. Defaults to 8M entries and is limited to 8M entries.
+  google.protobuf.UInt64Value maximum_ring_size = 3 [(validate.rules).uint64 = {lte: 8388608}];
+
+  // If true, a candidate window collects distinct physical hosts rather than raw ring slots.
+  bool deduplicate_hosts = 4;
+
+  // Common configuration for hashing-based load balancing policies.
+  common.v3.ConsistentHashingLbConfig consistent_hashing_lb_config = 5;
+
+  // Enable locality weighted load balancing for LRH explicitly.
+  common.v3.LocalityLbConfig.LocalityWeightedLbConfig locality_weighted_lb_config = 6;
+}
