@@ -4,14 +4,24 @@ namespace Envoy {
 namespace Upstream {
 
 BaseTester::BaseTester(uint64_t num_hosts, uint32_t weighted_subset_percent, uint32_t weight,
-                       bool attach_metadata) {
+                       bool attach_metadata)
+    : num_hosts_(num_hosts), attach_metadata_(attach_metadata) {
+  updateWeightedHosts(weighted_subset_percent, weight);
+}
+
+void BaseTester::updateWeightedHosts(uint32_t weighted_subset_percent, uint32_t weight,
+                                     uint64_t weighted_subset_offset) {
   Upstream::HostVector hosts;
-  ASSERT(num_hosts < 65536);
-  for (uint64_t i = 0; i < num_hosts; i++) {
-    const bool should_weight = i < num_hosts * (weighted_subset_percent / 100.0);
+  ASSERT(num_hosts_ < 65536);
+  const uint64_t weighted_hosts =
+      static_cast<uint64_t>(num_hosts_ * (weighted_subset_percent / 100.0));
+  for (uint64_t i = 0; i < num_hosts_; i++) {
+    const uint64_t offset_index =
+        (i + num_hosts_ - (weighted_subset_offset % num_hosts_)) % num_hosts_;
+    const bool should_weight = offset_index < weighted_hosts;
     const std::string url = fmt::format("tcp://10.0.{}.{}:6379", i / 256, i % 256);
     const auto effective_weight = should_weight ? weight : 1;
-    if (attach_metadata) {
+    if (attach_metadata_) {
       envoy::config::core::v3::Metadata metadata;
       Protobuf::Value value;
       value.set_number_value(i);

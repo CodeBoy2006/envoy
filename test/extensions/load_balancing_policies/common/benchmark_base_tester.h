@@ -28,9 +28,11 @@ namespace Upstream {
 class BaseTester : public Event::TestUsingSimulatedTime {
 public:
   static constexpr absl::string_view metadata_key = "key";
-  // We weight the first weighted_subset_percent of hosts with weight.
+  // We weight a deterministic subset of hosts with weight.
   BaseTester(uint64_t num_hosts, uint32_t weighted_subset_percent = 0, uint32_t weight = 0,
              bool attach_metadata = false);
+  void updateWeightedHosts(uint32_t weighted_subset_percent, uint32_t weight,
+                           uint64_t weighted_subset_offset = 0);
 
   Envoy::Thread::MutexBasicLockable lock_;
   // Reduce default log level to warn while running this benchmark to avoid problems due to
@@ -51,6 +53,10 @@ public:
   NiceMock<Runtime::MockLoader> runtime_;
   Random::RandomGeneratorImpl random_;
   std::shared_ptr<Upstream::MockClusterInfo> info_{new NiceMock<Upstream::MockClusterInfo>()};
+
+private:
+  uint64_t num_hosts_;
+  bool attach_metadata_;
 };
 
 class TestLoadBalancerContext : public Upstream::LoadBalancerContextBase {
