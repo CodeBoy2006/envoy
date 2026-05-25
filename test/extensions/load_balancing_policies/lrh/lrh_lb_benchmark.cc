@@ -901,6 +901,8 @@ BENCHMARK(benchmarkLrhLoadBalancerWeightUpdateSequence)
     ->Args({500, 65536, 8, 20, 10000, 10, 32, 1})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 0})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 0})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 1})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkLrhLoadBalancerWindowDebiasedWeightUpdateSequence(::benchmark::State& state) {
@@ -913,6 +915,8 @@ BENCHMARK(benchmarkLrhLoadBalancerWindowDebiasedWeightUpdateSequence)
     ->Args({500, 65536, 8, 20, 10000, 10, 32, 1})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 0})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 0})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 1})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(
@@ -1178,6 +1182,8 @@ BENCHMARK(benchmarkLrhLoadBalancerDirectWeightUpdateSequence)
     ->Args({500, 65536, 8, 20, 10000, 10, 32, 1})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 0})
     ->Args({500, 256000, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 0})
+    ->Args({500, 65536, 8, 200, 1000, 10, 32, 1})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State& state) {
@@ -1663,6 +1669,8 @@ BENCHMARK(benchmarkRingHashLoadBalancerWeightUpdateSequence)
     ->Args({500, 65536, 20, 10000, 10, 32, 1})
     ->Args({500, 256000, 20, 10000, 10, 32, 0})
     ->Args({500, 256000, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 200, 1000, 10, 32, 0})
+    ->Args({500, 65536, 200, 1000, 10, 32, 1})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkMaglevLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
@@ -1783,6 +1791,8 @@ BENCHMARK(benchmarkMaglevLoadBalancerWeightUpdateSequence)
     ->Args({500, 65537, 20, 10000, 10, 32, 1})
     ->Args({500, 262147, 20, 10000, 10, 32, 0})
     ->Args({500, 262147, 20, 10000, 10, 32, 1})
+    ->Args({500, 65537, 200, 1000, 10, 32, 0})
+    ->Args({500, 65537, 200, 1000, 10, 32, 1})
     ->Unit(::benchmark::kMillisecond);
 
 } // namespace
