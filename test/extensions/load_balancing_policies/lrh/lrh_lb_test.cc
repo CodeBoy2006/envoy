@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -341,6 +342,39 @@ TEST_F(LrhLoadBalancerTest, DirectWeightTableUpdateMovesTrafficWithoutRefresh) {
     EXPECT_EQ(after_assignments[key], chooseKeyAddress(*lb, key))
         << "scaled direct weights changed winner for key " << key;
   }
+}
+
+TEST_F(LrhLoadBalancerTest, WindowDebiasedWeightsImproveCapacityFitBelowExposureCap) {
+  const uint64_t keys = 20000;
+  const std::string heavy_address = "127.0.0.1:90";
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(4);
+
+  setHosts(makeWeightedHosts({4, 1, 1, 1, 1, 1, 1, 1}));
+  init();
+  auto direct_lb = workerLb();
+  uint64_t direct_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*direct_lb, key) == heavy_address) {
+      ++direct_heavy;
+    }
+  }
+
+  config_.set_weight_preprocessing(LrhLbProto::WINDOW_DEBIASED);
+  init();
+  auto debiased_lb = workerLb();
+  uint64_t debiased_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*debiased_lb, key) == heavy_address) {
+      ++debiased_heavy;
+    }
+  }
+
+  const double target_share = 4.0 / 11.0;
+  const double direct_error = std::abs(static_cast<double>(direct_heavy) / keys - target_share);
+  const double debiased_error = std::abs(static_cast<double>(debiased_heavy) / keys - target_share);
+  EXPECT_LT(debiased_error, direct_error)
+      << "direct=" << direct_heavy << " debiased=" << debiased_heavy;
 }
 
 TEST_F(LrhLoadBalancerTest, HealthFilteringSkipsUnhealthyHosts) {

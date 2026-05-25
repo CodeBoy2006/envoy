@@ -21,8 +21,18 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // Local Rendezvous Hashing (LRH) keeps a stable host-token ring, scans a small
 // contiguous local candidate window for each request hash, and selects the
 // candidate with the best weighted rendezvous score.
-// [#next-free-field: 7]
+// [#next-free-field: 8]
 message LocalRendezvousHashing {
+  enum WeightPreprocessing {
+    // Use Envoy normalized host weights directly in the local weighted rendezvous race.
+    DIRECT = 0;
+
+    // Apply the finite-window mean-field transform x=(C-1)r/(C-r) before the local race.
+    // This improves capacity fit below the candidate-window exposure cap while preserving
+    // the same candidate generator.
+    WINDOW_DEBIASED = 1;
+  }
+
   // Number of local ring slots to score per request. Defaults to 8.
   google.protobuf.UInt32Value candidate_count = 1
       [(validate.rules).uint32 = {lte: 64 gte: 1}];
@@ -42,4 +52,9 @@ message LocalRendezvousHashing {
 
   // Enable locality weighted load balancing for LRH explicitly.
   common.v3.LocalityLbConfig.LocalityWeightedLbConfig locality_weighted_lb_config = 6;
+
+  // Controls how host weights are preprocessed before the local weighted rendezvous race.
+  // Defaults to DIRECT to preserve Envoy's configured host-weight semantics.
+  WeightPreprocessing weight_preprocessing = 7
+      [(validate.rules).enum = {defined_only: true}];
 }

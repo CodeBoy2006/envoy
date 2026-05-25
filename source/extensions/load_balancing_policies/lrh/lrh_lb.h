@@ -67,7 +67,7 @@ public:
   const LrhLoadBalancerStats& stats() const { return stats_; }
 
   static LrhLoadBalancerStats generateStats(Stats::Scope& scope);
-  bool updateWeightsForTest(absl::Span<const double> effective_weights_by_host);
+  bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
   bool updateHostWeightsForTest(absl::Span<const std::pair<uint32_t, double>> weight_updates);
 
   static constexpr uint32_t DefaultCandidateCount = 8;
@@ -88,7 +88,8 @@ private:
 
     Ring(const NormalizedHostWeightVector& normalized_host_weights, double min_normalized_weight,
          uint64_t min_ring_size, uint64_t max_ring_size, uint32_t candidate_count,
-         bool deduplicate_hosts, bool use_hostname_for_hashing, TopologySharedPtr cached_topology,
+         bool deduplicate_hosts, bool use_hostname_for_hashing,
+         LrhLbProto::WeightPreprocessing weight_preprocessing, TopologySharedPtr cached_topology,
          LrhLoadBalancerStats& stats);
 
     // ThreadAwareLoadBalancerBase::HashingLoadBalancer
@@ -97,17 +98,17 @@ private:
     size_t ringSizeForTest() const { return ring_->size(); }
     size_t candidateCountForTest() const { return candidate_count_; }
     TopologySharedPtr topology() const { return topology_; }
-    bool updateWeightsForTest(absl::Span<const double> effective_weights_by_host);
+    bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
     bool updateHostWeightsForTest(absl::Span<const std::pair<uint32_t, double>> weight_updates);
 
   private:
     struct HostState {
-      HostState(HostConstSharedPtr host, uint64_t host_hash, double effective_weight)
-          : host_(std::move(host)), host_hash_(host_hash), effective_weight_(effective_weight) {}
+      HostState(HostConstSharedPtr host, uint64_t host_hash, double capacity_weight)
+          : host_(std::move(host)), host_hash_(host_hash), capacity_weight_(capacity_weight) {}
 
       HostConstSharedPtr host_;
       uint64_t host_hash_;
-      std::atomic<double> effective_weight_;
+      std::atomic<double> capacity_weight_;
     };
     using HostStateSharedPtr = std::shared_ptr<HostState>;
 
@@ -115,26 +116,31 @@ private:
       HostConstSharedPtr host_;
       std::string hash_key_;
       uint64_t host_hash_;
-      double effective_weight_;
+      double capacity_weight_;
     };
 
     static constexpr double MinEffectiveWeight = std::numeric_limits<double>::min();
+    static constexpr double WindowDebiasedEpsilon = 1.0e-9;
 
     size_t lowerBound(uint64_t hash) const;
     const HostState* bestInCandidateBlock(uint64_t hash, size_t start, size_t max_slots,
                                           size_t& walked) const;
-    static double weightedScore(uint64_t request_hash, const HostState& host_state);
+    double weightedScore(uint64_t request_hash, const HostState& host_state) const;
     static TopologySharedPtr buildTopology(const std::vector<InitialHostState>& host_states,
                                            uint64_t min_ring_size, uint64_t max_ring_size);
     static bool topologyMatches(const Topology& topology,
                                 const std::vector<InitialHostState>& host_states);
     static double sanitizeWeight(double effective_weight);
+    static double windowDebiasedWeight(double capacity_weight, double total_capacity_weight,
+                                       size_t host_count, uint32_t candidate_count);
 
     TopologySharedPtr topology_;
     const std::vector<RingEntry>* ring_{};
     std::vector<HostStateSharedPtr> host_states_;
+    std::atomic<double> total_capacity_weight_{MinEffectiveWeight};
     const uint32_t candidate_count_;
     const bool deduplicate_hosts_;
+    const LrhLbProto::WeightPreprocessing weight_preprocessing_;
     LrhLoadBalancerStats& stats_;
   };
 
@@ -150,6 +156,7 @@ private:
   const uint32_t candidate_count_;
   const bool deduplicate_hosts_;
   const bool use_hostname_for_hashing_;
+  const LrhLbProto::WeightPreprocessing weight_preprocessing_;
   const uint32_t hash_balance_factor_;
   Ring::TopologySharedPtr cached_topology_;
   std::weak_ptr<Ring> latest_ring_for_test_;

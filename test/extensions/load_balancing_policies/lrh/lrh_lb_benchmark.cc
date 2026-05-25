@@ -23,11 +23,13 @@ namespace {
 class LrhTester : public BaseTester {
 public:
   LrhTester(uint64_t num_hosts, uint64_t min_ring_size, uint32_t candidate_count,
-            uint32_t weighted_subset_percent = 0, uint32_t weight = 0)
+            uint32_t weighted_subset_percent = 0, uint32_t weight = 0,
+            LrhLbProto::WeightPreprocessing weight_preprocessing = LrhLbProto::DIRECT)
       : BaseTester(num_hosts, weighted_subset_percent, weight) {
     envoy::extensions::load_balancing_policies::lrh::v3::LocalRendezvousHashing config;
     config.mutable_minimum_ring_size()->set_value(min_ring_size);
     config.mutable_candidate_count()->set_value(candidate_count);
+    config.set_weight_preprocessing(weight_preprocessing);
     lrh_lb_ = std::make_unique<LrhLoadBalancer>(priority_set_, stats_, stats_scope_, runtime_,
                                                 random_, 50, config, hash_policy_);
   }
@@ -528,7 +530,8 @@ BENCHMARK(benchmarkMaglevLoadBalancerChooseHost)
     ->Args({500, 262147, 100000})
     ->Unit(::benchmark::kMillisecond);
 
-void benchmarkLrhLoadBalancerWeightUpdate(::benchmark::State& state) {
+void benchmarkLrhLoadBalancerWeightUpdateImpl(
+    ::benchmark::State& state, LrhLbProto::WeightPreprocessing weight_preprocessing) {
   for (auto _ : state) { // NOLINT: Silences warning about dead store
     state.PauseTiming();
     const uint64_t num_hosts = state.range(0);
@@ -539,7 +542,7 @@ void benchmarkLrhLoadBalancerWeightUpdate(::benchmark::State& state) {
     const uint64_t keys_to_simulate = state.range(5);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
 
-    LrhTester before_tester(num_hosts, min_ring_size, candidate_count);
+    LrhTester before_tester(num_hosts, min_ring_size, candidate_count, 0, 0, weight_preprocessing);
     ASSERT_TRUE(before_tester.lrh_lb_->initialize().ok());
     const SlotStats before_slots{before_tester.lrh_lb_->stats().size_.value(),
                                  before_tester.lrh_lb_->stats().min_hashes_per_host_.value(),
@@ -554,7 +557,7 @@ void benchmarkLrhLoadBalancerWeightUpdate(::benchmark::State& state) {
                    before_hits, &before_assignments, before_weighted_hits);
 
     LrhTester after_tester(num_hosts, min_ring_size, candidate_count, weighted_subset_percent,
-                           updated_weight);
+                           updated_weight, weight_preprocessing);
     ASSERT_TRUE(after_tester.lrh_lb_->initialize().ok());
     const SlotStats after_slots{after_tester.lrh_lb_->stats().size_.value(),
                                 after_tester.lrh_lb_->stats().min_hashes_per_host_.value(),
@@ -574,11 +577,29 @@ void benchmarkLrhLoadBalancerWeightUpdate(::benchmark::State& state) {
                             weighted_hosts, keys_to_simulate, before_weighted_hits,
                             after_weighted_hits, changed_assignments, before_hits, after_hits,
                             candidate_count);
+    state.counters["window_debiased_weight_preprocessing"] =
+        weight_preprocessing == LrhLbProto::WINDOW_DEBIASED ? 1 : 0;
     recordSlotStats(state, before_slots, after_slots);
     state.ResumeTiming();
   }
 }
+
+void benchmarkLrhLoadBalancerWeightUpdate(::benchmark::State& state) {
+  benchmarkLrhLoadBalancerWeightUpdateImpl(state, LrhLbProto::DIRECT);
+}
 BENCHMARK(benchmarkLrhLoadBalancerWeightUpdate)
+    ->Args({100, 65536, 8, 10, 32, 100000})
+    ->Args({100, 65536, 8, 20, 8, 100000})
+    ->Args({500, 65536, 8, 10, 32, 100000})
+    ->Args({500, 65536, 8, 20, 8, 100000})
+    ->Args({500, 256000, 8, 10, 32, 100000})
+    ->Args({500, 256000, 8, 20, 8, 100000})
+    ->Unit(::benchmark::kMillisecond);
+
+void benchmarkLrhLoadBalancerWindowDebiasedWeightUpdate(::benchmark::State& state) {
+  benchmarkLrhLoadBalancerWeightUpdateImpl(state, LrhLbProto::WINDOW_DEBIASED);
+}
+BENCHMARK(benchmarkLrhLoadBalancerWindowDebiasedWeightUpdate)
     ->Args({100, 65536, 8, 10, 32, 100000})
     ->Args({100, 65536, 8, 20, 8, 100000})
     ->Args({500, 65536, 8, 10, 32, 100000})
@@ -702,7 +723,8 @@ BENCHMARK(benchmarkMaglevLoadBalancerWeightUpdate)
     ->Args({500, 262147, 20, 8, 100000})
     ->Unit(::benchmark::kMillisecond);
 
-void benchmarkLrhLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
+void benchmarkLrhLoadBalancerWeightUpdateSequenceImpl(
+    ::benchmark::State& state, LrhLbProto::WeightPreprocessing weight_preprocessing) {
   for (auto _ : state) { // NOLINT: Silences warning about dead store
     state.PauseTiming();
     const uint64_t num_hosts = state.range(0);
@@ -715,7 +737,7 @@ void benchmarkLrhLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
     const uint32_t pattern = state.range(7);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
 
-    LrhTester tester(num_hosts, min_ring_size, candidate_count);
+    LrhTester tester(num_hosts, min_ring_size, candidate_count, 0, 0, weight_preprocessing);
     ASSERT_TRUE(tester.lrh_lb_->initialize().ok());
     std::vector<std::string> previous_assignments;
     previous_assignments.reserve(keys_per_epoch);
@@ -811,10 +833,28 @@ void benchmarkLrhLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
                         target_error_percent_total, cv_total, max_over_avg_total,
                         p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
                         min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
+    state.counters["window_debiased_weight_preprocessing"] =
+        weight_preprocessing == LrhLbProto::WINDOW_DEBIASED ? 1 : 0;
     state.ResumeTiming();
   }
 }
+
+void benchmarkLrhLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
+  benchmarkLrhLoadBalancerWeightUpdateSequenceImpl(state, LrhLbProto::DIRECT);
+}
 BENCHMARK(benchmarkLrhLoadBalancerWeightUpdateSequence)
+    ->Args({100, 65536, 8, 20, 10000, 10, 32, 0})
+    ->Args({100, 65536, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 65536, 8, 20, 10000, 10, 32, 0})
+    ->Args({500, 65536, 8, 20, 10000, 10, 32, 1})
+    ->Args({500, 256000, 8, 20, 10000, 10, 32, 0})
+    ->Args({500, 256000, 8, 20, 10000, 10, 32, 1})
+    ->Unit(::benchmark::kMillisecond);
+
+void benchmarkLrhLoadBalancerWindowDebiasedWeightUpdateSequence(::benchmark::State& state) {
+  benchmarkLrhLoadBalancerWeightUpdateSequenceImpl(state, LrhLbProto::WINDOW_DEBIASED);
+}
+BENCHMARK(benchmarkLrhLoadBalancerWindowDebiasedWeightUpdateSequence)
     ->Args({100, 65536, 8, 20, 10000, 10, 32, 0})
     ->Args({100, 65536, 8, 20, 10000, 10, 32, 1})
     ->Args({500, 65536, 8, 20, 10000, 10, 32, 0})

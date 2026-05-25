@@ -92,6 +92,16 @@ TEST(LrhConfigTest, Validate) {
     EXPECT_THAT(err, HasSubstr("LocalRendezvousHashingValidationError.MaximumRingSize"));
     EXPECT_THAT(err, HasSubstr("8388608"));
   }
+
+  {
+    envoy::extensions::load_balancing_policies::lrh::v3::LocalRendezvousHashing config_msg;
+    config_msg.set_weight_preprocessing(
+        static_cast<envoy::extensions::load_balancing_policies::lrh::v3::LocalRendezvousHashing::
+                        WeightPreprocessing>(42));
+    std::string err;
+    EXPECT_FALSE(Validate(config_msg, &err));
+    EXPECT_THAT(err, HasSubstr("LocalRendezvousHashingValidationError.WeightPreprocessing"));
+  }
 }
 
 } // namespace

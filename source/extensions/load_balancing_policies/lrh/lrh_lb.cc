@@ -49,6 +49,7 @@ LrhLoadBalancer::LrhLoadBalancer(const PrioritySet& priority_set, ClusterLbStats
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, candidate_count, DefaultCandidateCount)),
       deduplicate_hosts_(config.deduplicate_hosts()),
       use_hostname_for_hashing_(config.consistent_hashing_lb_config().use_hostname_for_hashing()),
+      weight_preprocessing_(config.weight_preprocessing()),
       hash_balance_factor_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(config.consistent_hashing_lb_config(),
                                                            hash_balance_factor, 0)) {
   if (min_ring_size_ > max_ring_size_) {
@@ -67,7 +68,8 @@ LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized
                                     double /* max_normalized_weight */) {
   auto ring = std::make_shared<Ring>(normalized_host_weights, min_normalized_weight, min_ring_size_,
                                      max_ring_size_, candidate_count_, deduplicate_hosts_,
-                                     use_hostname_for_hashing_, cached_topology_, stats_);
+                                     use_hostname_for_hashing_, weight_preprocessing_,
+                                     cached_topology_, stats_);
   cached_topology_ = ring->topology();
   latest_ring_for_test_ = ring;
 
@@ -85,9 +87,9 @@ LrhLoadBalancerStats LrhLoadBalancer::generateStats(Stats::Scope& scope) {
   return {ALL_LRH_LOAD_BALANCER_STATS(POOL_GAUGE(scope))};
 }
 
-bool LrhLoadBalancer::updateWeightsForTest(absl::Span<const double> effective_weights_by_host) {
+bool LrhLoadBalancer::updateWeightsForTest(absl::Span<const double> capacity_weights_by_host) {
   auto ring = latest_ring_for_test_.lock();
-  return ring != nullptr && ring->updateWeightsForTest(effective_weights_by_host);
+  return ring != nullptr && ring->updateWeightsForTest(capacity_weights_by_host);
 }
 
 bool LrhLoadBalancer::updateHostWeightsForTest(
@@ -110,13 +112,35 @@ double LrhLoadBalancer::Ring::sanitizeWeight(double effective_weight) {
   return std::max(effective_weight, MinEffectiveWeight);
 }
 
-double LrhLoadBalancer::Ring::weightedScore(uint64_t request_hash, const HostState& host_state) {
+double LrhLoadBalancer::Ring::windowDebiasedWeight(double capacity_weight,
+                                                   double total_capacity_weight, size_t host_count,
+                                                   uint32_t candidate_count) {
+  if (candidate_count <= 1 || host_count == 0) {
+    return sanitizeWeight(capacity_weight);
+  }
+
+  const double c = static_cast<double>(candidate_count);
+  const double max_relative = c - WindowDebiasedEpsilon;
+  const double relative_capacity = std::min(
+      static_cast<double>(host_count) * capacity_weight / total_capacity_weight, max_relative);
+  return sanitizeWeight(((c - 1.0) * relative_capacity) / (c - relative_capacity));
+}
+
+double LrhLoadBalancer::Ring::weightedScore(uint64_t request_hash,
+                                            const HostState& host_state) const {
   const uint64_t score_hash = HashUtil::xxHash64Value(request_hash, host_state.host_hash_);
 
   // Map to (0, 1] and use exponential-race scoring. Lower scores win.
   const double u = (static_cast<double>(score_hash) + 1.0) /
                    (static_cast<double>(std::numeric_limits<uint64_t>::max()) + 1.0);
-  return -std::log(u) / host_state.effective_weight_.load(std::memory_order_relaxed);
+  const double capacity_weight = host_state.capacity_weight_.load(std::memory_order_relaxed);
+  if (weight_preprocessing_ == LrhLbProto::WINDOW_DEBIASED) {
+    const double debiased_weight = windowDebiasedWeight(
+        capacity_weight, total_capacity_weight_.load(std::memory_order_relaxed),
+        host_states_.size(), candidate_count_);
+    return -std::log(u) / debiased_weight;
+  }
+  return -std::log(u) / capacity_weight;
 }
 
 const LrhLoadBalancer::Ring::HostState*
@@ -180,14 +204,17 @@ HostSelectionResponse LrhLoadBalancer::Ring::chooseHost(uint64_t hash, uint32_t 
 }
 
 bool LrhLoadBalancer::Ring::updateWeightsForTest(
-    absl::Span<const double> effective_weights_by_host) {
-  if (effective_weights_by_host.size() != host_states_.size()) {
+    absl::Span<const double> capacity_weights_by_host) {
+  if (capacity_weights_by_host.size() != host_states_.size()) {
     return false;
   }
-  for (size_t i = 0; i < effective_weights_by_host.size(); ++i) {
-    host_states_[i]->effective_weight_.store(sanitizeWeight(effective_weights_by_host[i]),
-                                             std::memory_order_relaxed);
+  double total_capacity_weight = 0.0;
+  for (size_t i = 0; i < capacity_weights_by_host.size(); ++i) {
+    const double capacity_weight = sanitizeWeight(capacity_weights_by_host[i]);
+    host_states_[i]->capacity_weight_.store(capacity_weight, std::memory_order_relaxed);
+    total_capacity_weight += capacity_weight;
   }
+  total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
   return true;
 }
 
@@ -198,10 +225,15 @@ bool LrhLoadBalancer::Ring::updateHostWeightsForTest(
       return false;
     }
   }
+  double total_capacity_weight = total_capacity_weight_.load(std::memory_order_relaxed);
   for (const auto& update : weight_updates) {
-    host_states_[update.first]->effective_weight_.store(sanitizeWeight(update.second),
-                                                        std::memory_order_relaxed);
+    HostState& host_state = *host_states_[update.first];
+    const double old_weight = host_state.capacity_weight_.load(std::memory_order_relaxed);
+    const double new_weight = sanitizeWeight(update.second);
+    host_state.capacity_weight_.store(new_weight, std::memory_order_relaxed);
+    total_capacity_weight += new_weight - old_weight;
   }
+  total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
   return true;
 }
 
@@ -209,23 +241,28 @@ LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_we
                             double /* min_normalized_weight */, uint64_t min_ring_size,
                             uint64_t max_ring_size, uint32_t candidate_count,
                             bool deduplicate_hosts, bool use_hostname_for_hashing,
+                            LrhLbProto::WeightPreprocessing weight_preprocessing,
                             TopologySharedPtr cached_topology, LrhLoadBalancerStats& stats)
-    : candidate_count_(candidate_count), deduplicate_hosts_(deduplicate_hosts), stats_(stats) {
+    : candidate_count_(candidate_count), deduplicate_hosts_(deduplicate_hosts),
+      weight_preprocessing_(weight_preprocessing), stats_(stats) {
   std::vector<InitialHostState> initial_host_states;
   initial_host_states.reserve(normalized_host_weights.size());
   host_states_.reserve(normalized_host_weights.size());
+  double total_capacity_weight = 0.0;
 
   for (const auto& entry : normalized_host_weights) {
     const auto& host = entry.first;
-    const double effective_weight = sanitizeWeight(entry.second);
+    const double capacity_weight = sanitizeWeight(entry.second);
     const absl::string_view key_to_hash = hashKey(host, use_hostname_for_hashing);
     ASSERT(!key_to_hash.empty());
     const std::string hash_key(key_to_hash);
     const uint64_t host_hash = HashUtil::xxHash64(hash_key);
 
-    initial_host_states.push_back({host, hash_key, host_hash, effective_weight});
-    host_states_.push_back(std::make_shared<HostState>(host, host_hash, effective_weight));
+    initial_host_states.push_back({host, hash_key, host_hash, capacity_weight});
+    host_states_.push_back(std::make_shared<HostState>(host, host_hash, capacity_weight));
+    total_capacity_weight += capacity_weight;
   }
+  total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
 
   if (cached_topology != nullptr && topologyMatches(*cached_topology, initial_host_states)) {
     topology_ = std::move(cached_topology);
