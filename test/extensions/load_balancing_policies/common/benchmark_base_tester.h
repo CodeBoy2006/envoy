@@ -32,7 +32,7 @@ public:
   BaseTester(uint64_t num_hosts, uint32_t weighted_subset_percent = 0, uint32_t weight = 0,
              bool attach_metadata = false);
   void updateWeightedHosts(uint32_t weighted_subset_percent, uint32_t weight,
-                           uint64_t weighted_subset_offset = 0);
+                           uint64_t weighted_subset_offset = 0, uint32_t unweighted_weight = 1);
 
   Envoy::Thread::MutexBasicLockable lock_;
   // Reduce default log level to warn while running this benchmark to avoid problems due to

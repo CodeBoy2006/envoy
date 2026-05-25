@@ -10,7 +10,7 @@ BaseTester::BaseTester(uint64_t num_hosts, uint32_t weighted_subset_percent, uin
 }
 
 void BaseTester::updateWeightedHosts(uint32_t weighted_subset_percent, uint32_t weight,
-                                     uint64_t weighted_subset_offset) {
+                                     uint64_t weighted_subset_offset, uint32_t unweighted_weight) {
   Upstream::HostVector hosts;
   ASSERT(num_hosts_ < 65536);
   const uint64_t weighted_hosts =
@@ -20,7 +20,7 @@ void BaseTester::updateWeightedHosts(uint32_t weighted_subset_percent, uint32_t 
         (i + num_hosts_ - (weighted_subset_offset % num_hosts_)) % num_hosts_;
     const bool should_weight = offset_index < weighted_hosts;
     const std::string url = fmt::format("tcp://10.0.{}.{}:6379", i / 256, i % 256);
-    const auto effective_weight = should_weight ? weight : 1;
+    const auto effective_weight = should_weight ? weight : unweighted_weight;
     if (attach_metadata_) {
       envoy::config::core::v3::Metadata metadata;
       Protobuf::Value value;

@@ -124,6 +124,15 @@ double weightedSubsetGlobalTargetPercent(uint64_t num_hosts, uint64_t weighted_h
                    (static_cast<double>(weighted_hosts) * weight + unweighted_hosts);
 }
 
+double weightedSubsetGlobalTargetPercent(uint64_t num_hosts, uint64_t weighted_hosts,
+                                         double weighted_weight, double unweighted_weight) {
+  const uint64_t unweighted_hosts = num_hosts - weighted_hosts;
+  const double weighted_capacity = static_cast<double>(weighted_hosts) * weighted_weight;
+  const double unweighted_capacity = static_cast<double>(unweighted_hosts) * unweighted_weight;
+  const double total_capacity = weighted_capacity + unweighted_capacity;
+  return total_capacity > 0 ? 100.0 * weighted_capacity / total_capacity : 0.0;
+}
+
 uint64_t weightedSubsetOffsetForEpoch(uint64_t epoch, uint64_t num_hosts, uint64_t weighted_hosts,
                                       uint32_t pattern) {
   if (pattern == 1) {
@@ -139,18 +148,16 @@ uint32_t weightForEpoch(uint64_t epoch, uint32_t max_weight, uint32_t pattern) {
   return max_weight;
 }
 
-uint32_t warmupWeightForEpoch(uint64_t epoch, uint32_t epochs, uint32_t max_weight) {
-  if (max_weight <= 1) {
-    return 1;
-  }
+double warmupFactorForEpoch(uint64_t epoch, uint32_t epochs) {
   if (epochs <= 1) {
-    return max_weight;
+    return 1.0;
   }
+  return static_cast<double>(epoch) / static_cast<double>(epochs - 1);
+}
 
-  const double progress = static_cast<double>(epoch) / static_cast<double>(epochs - 1);
-  return std::max<uint32_t>(
-      1, std::min<uint32_t>(max_weight,
-                            1 + static_cast<uint32_t>(std::round(progress * (max_weight - 1)))));
+uint32_t scaledWarmupWeightForEpoch(uint64_t epoch, uint32_t epochs, uint32_t weight_scale) {
+  return std::min<uint32_t>(weight_scale, static_cast<uint32_t>(std::round(
+                                              warmupFactorForEpoch(epoch, epochs) * weight_scale)));
 }
 
 std::vector<std::vector<std::pair<uint32_t, double>>>
@@ -188,7 +195,7 @@ directWeightUpdatesByEpoch(uint64_t num_hosts, uint32_t epochs, uint32_t weighte
 
 std::vector<std::vector<std::pair<uint32_t, double>>>
 directWarmupWeightUpdatesByEpoch(uint64_t num_hosts, uint32_t epochs,
-                                 uint32_t weighted_subset_percent, uint32_t max_weight) {
+                                 uint32_t weighted_subset_percent) {
   const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
   const double base_weight = 1.0 / static_cast<double>(num_hosts);
   std::vector<double> current_weights(num_hosts, base_weight);
@@ -196,12 +203,12 @@ directWarmupWeightUpdatesByEpoch(uint64_t num_hosts, uint32_t epochs,
   updates_by_epoch.reserve(epochs);
 
   for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
-    const uint32_t weight = warmupWeightForEpoch(epoch, epochs, max_weight);
+    const double weight = warmupFactorForEpoch(epoch, epochs);
     std::vector<std::pair<uint32_t, double>> updates;
 
     for (uint64_t i = 0; i < num_hosts; ++i) {
       const bool should_weight = i < weighted_hosts;
-      const double target_weight = static_cast<double>(should_weight ? weight : 1) * base_weight;
+      const double target_weight = (should_weight ? weight : 1.0) * base_weight;
       if (current_weights[i] != target_weight) {
         ASSERT(i <= std::numeric_limits<uint32_t>::max());
         updates.push_back({static_cast<uint32_t>(i), target_weight});
@@ -918,7 +925,7 @@ void benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(
     const uint32_t epochs = state.range(3);
     const uint64_t keys_per_epoch = state.range(4);
     const uint32_t weighted_subset_percent = state.range(5);
-    const uint32_t max_weight = state.range(6);
+    const uint32_t weight_scale = state.range(6);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
 
     LrhTester tester(num_hosts, min_ring_size, candidate_count, 0, 0, weight_preprocessing);
@@ -945,10 +952,10 @@ void benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(
 
     state.ResumeTiming();
     for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
-      const uint32_t weight = warmupWeightForEpoch(epoch, epochs, max_weight);
+      const uint32_t weight = scaledWarmupWeightForEpoch(epoch, epochs, weight_scale);
 
       const auto update_start = std::chrono::steady_clock::now();
-      tester.updateWeightedHosts(weighted_subset_percent, weight);
+      tester.updateWeightedHosts(weighted_subset_percent, weight, 0, weight_scale);
       const auto update_end = std::chrono::steady_clock::now();
       update_ms_total +=
           std::chrono::duration<double, std::milli>(update_end - update_start).count();
@@ -998,9 +1005,10 @@ void benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(
       const double epoch_weighted_percent =
           100.0 * weighted_subset_hits / static_cast<double>(keys_per_epoch);
       weighted_subset_percent_total += epoch_weighted_percent;
-      target_error_percent_total +=
-          std::abs(epoch_weighted_percent -
-                   weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, weight));
+      target_error_percent_total += std::abs(
+          epoch_weighted_percent -
+          weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, static_cast<double>(weight),
+                                            static_cast<double>(weight_scale)));
       const HitDistributionStats hit_stats = summarizeHitDistribution(hit_counter, num_hosts);
       cv_total += hit_stats.cv;
       max_over_avg_total += hit_stats.max_over_avg;
@@ -1008,15 +1016,17 @@ void benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(
     }
     state.PauseTiming();
 
-    recordSequenceStats(
-        state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, max_weight,
-        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total, changed_percent_total,
-        changed_percent_max, weighted_subset_percent_total, target_error_percent_total, cv_total,
-        max_over_avg_total, p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
-        min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
+    recordSequenceStats(state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, 1,
+                        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total,
+                        changed_percent_total, changed_percent_max, weighted_subset_percent_total,
+                        target_error_percent_total, cv_total, max_over_avg_total,
+                        p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
+                        min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
     state.counters["warmup_ramp"] = 1;
-    state.counters["warmup_start_weight"] = warmupWeightForEpoch(0, epochs, max_weight);
-    state.counters["warmup_final_weight"] = warmupWeightForEpoch(epochs - 1, epochs, max_weight);
+    state.counters["warmup_continuous_ramp"] = 1;
+    state.counters["warmup_start_weight"] = 0;
+    state.counters["warmup_final_weight"] = 1;
+    state.counters["warmup_weight_scale"] = weight_scale;
     state.counters["window_debiased_weight_preprocessing"] =
         weight_preprocessing == LrhLbProto::WINDOW_DEBIASED ? 1 : 0;
     state.ResumeTiming();
@@ -1027,18 +1037,18 @@ void benchmarkLrhLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& stat
   benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(state, LrhLbProto::DIRECT);
 }
 BENCHMARK(benchmarkLrhLoadBalancerWarmupWeightUpdateSequence)
-    ->Args({100, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 256000, 8, 20, 10000, 10, 32})
+    ->Args({100, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 256000, 8, 20, 10000, 10, 1000})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkLrhLoadBalancerWindowDebiasedWarmupWeightUpdateSequence(::benchmark::State& state) {
   benchmarkLrhLoadBalancerWarmupWeightUpdateSequenceImpl(state, LrhLbProto::WINDOW_DEBIASED);
 }
 BENCHMARK(benchmarkLrhLoadBalancerWindowDebiasedWarmupWeightUpdateSequence)
-    ->Args({100, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 256000, 8, 20, 10000, 10, 32})
+    ->Args({100, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 256000, 8, 20, 10000, 10, 1000})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkLrhLoadBalancerDirectWeightUpdateSequence(::benchmark::State& state) {
@@ -1179,10 +1189,10 @@ void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State
     const uint32_t epochs = state.range(3);
     const uint64_t keys_per_epoch = state.range(4);
     const uint32_t weighted_subset_percent = state.range(5);
-    const uint32_t max_weight = state.range(6);
+    const uint32_t weight_scale = state.range(6);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
     const auto updates_by_epoch =
-        directWarmupWeightUpdatesByEpoch(num_hosts, epochs, weighted_subset_percent, max_weight);
+        directWarmupWeightUpdatesByEpoch(num_hosts, epochs, weighted_subset_percent);
 
     LrhTester tester(num_hosts, min_ring_size, candidate_count);
     ASSERT_TRUE(tester.lrh_lb_->initialize().ok());
@@ -1210,7 +1220,7 @@ void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State
 
     state.ResumeTiming();
     for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
-      const uint32_t weight = warmupWeightForEpoch(epoch, epochs, max_weight);
+      const double warmup_factor = warmupFactorForEpoch(epoch, epochs);
 
       const auto update_start = std::chrono::steady_clock::now();
       ASSERT_TRUE(tester.lrh_lb_->updateHostWeightsForTest(updates_by_epoch[epoch]));
@@ -1264,8 +1274,8 @@ void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State
           100.0 * weighted_subset_hits / static_cast<double>(keys_per_epoch);
       weighted_subset_percent_total += epoch_weighted_percent;
       target_error_percent_total +=
-          std::abs(epoch_weighted_percent -
-                   weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, weight));
+          std::abs(epoch_weighted_percent - weightedSubsetGlobalTargetPercent(
+                                                num_hosts, weighted_hosts, warmup_factor, 1.0));
       const HitDistributionStats hit_stats = summarizeHitDistribution(hit_counter, num_hosts);
       cv_total += hit_stats.cv;
       max_over_avg_total += hit_stats.max_over_avg;
@@ -1273,16 +1283,18 @@ void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State
     }
     state.PauseTiming();
 
-    recordSequenceStats(
-        state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, max_weight,
-        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total, changed_percent_total,
-        changed_percent_max, weighted_subset_percent_total, target_error_percent_total, cv_total,
-        max_over_avg_total, p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
-        min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
+    recordSequenceStats(state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, 1,
+                        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total,
+                        changed_percent_total, changed_percent_max, weighted_subset_percent_total,
+                        target_error_percent_total, cv_total, max_over_avg_total,
+                        p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
+                        min_slots_delta_abs_total, max_slots_delta_abs_total, candidate_count);
     state.counters["direct_weight_table_update"] = 1;
     state.counters["warmup_ramp"] = 1;
-    state.counters["warmup_start_weight"] = warmupWeightForEpoch(0, epochs, max_weight);
-    state.counters["warmup_final_weight"] = warmupWeightForEpoch(epochs - 1, epochs, max_weight);
+    state.counters["warmup_continuous_ramp"] = 1;
+    state.counters["warmup_start_weight"] = 0;
+    state.counters["warmup_final_weight"] = 1;
+    state.counters["warmup_weight_scale"] = weight_scale;
     state.counters["weight_updates_avg"] = weight_updates_total / epochs;
     state.counters["weight_updates_per_second"] =
         update_ms_total > 0 ? 1000.0 * weight_updates_total / update_ms_total : 0.0;
@@ -1290,9 +1302,9 @@ void benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence(::benchmark::State
   }
 }
 BENCHMARK(benchmarkLrhLoadBalancerDirectWarmupWeightUpdateSequence)
-    ->Args({100, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 65536, 8, 20, 10000, 10, 32})
-    ->Args({500, 256000, 8, 20, 10000, 10, 32})
+    ->Args({100, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 65536, 8, 20, 10000, 10, 1000})
+    ->Args({500, 256000, 8, 20, 10000, 10, 1000})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& state) {
@@ -1303,7 +1315,7 @@ void benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence(::benchmark::State&
     const uint32_t epochs = state.range(2);
     const uint64_t keys_per_epoch = state.range(3);
     const uint32_t weighted_subset_percent = state.range(4);
-    const uint32_t max_weight = state.range(5);
+    const uint32_t weight_scale = state.range(5);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
 
     RingHashTester tester(num_hosts, min_ring_size);
@@ -1330,10 +1342,10 @@ void benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence(::benchmark::State&
 
     state.ResumeTiming();
     for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
-      const uint32_t weight = warmupWeightForEpoch(epoch, epochs, max_weight);
+      const uint32_t weight = scaledWarmupWeightForEpoch(epoch, epochs, weight_scale);
 
       const auto update_start = std::chrono::steady_clock::now();
-      tester.updateWeightedHosts(weighted_subset_percent, weight);
+      tester.updateWeightedHosts(weighted_subset_percent, weight, 0, weight_scale);
       const auto update_end = std::chrono::steady_clock::now();
       update_ms_total +=
           std::chrono::duration<double, std::milli>(update_end - update_start).count();
@@ -1383,9 +1395,10 @@ void benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence(::benchmark::State&
       const double epoch_weighted_percent =
           100.0 * weighted_subset_hits / static_cast<double>(keys_per_epoch);
       weighted_subset_percent_total += epoch_weighted_percent;
-      target_error_percent_total +=
-          std::abs(epoch_weighted_percent -
-                   weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, weight));
+      target_error_percent_total += std::abs(
+          epoch_weighted_percent -
+          weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, static_cast<double>(weight),
+                                            static_cast<double>(weight_scale)));
       const HitDistributionStats hit_stats = summarizeHitDistribution(hit_counter, num_hosts);
       cv_total += hit_stats.cv;
       max_over_avg_total += hit_stats.max_over_avg;
@@ -1393,22 +1406,24 @@ void benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence(::benchmark::State&
     }
     state.PauseTiming();
 
-    recordSequenceStats(
-        state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, max_weight,
-        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total, changed_percent_total,
-        changed_percent_max, weighted_subset_percent_total, target_error_percent_total, cv_total,
-        max_over_avg_total, p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
-        min_slots_delta_abs_total, max_slots_delta_abs_total);
+    recordSequenceStats(state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, 1,
+                        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total,
+                        changed_percent_total, changed_percent_max, weighted_subset_percent_total,
+                        target_error_percent_total, cv_total, max_over_avg_total,
+                        p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
+                        min_slots_delta_abs_total, max_slots_delta_abs_total);
     state.counters["warmup_ramp"] = 1;
-    state.counters["warmup_start_weight"] = warmupWeightForEpoch(0, epochs, max_weight);
-    state.counters["warmup_final_weight"] = warmupWeightForEpoch(epochs - 1, epochs, max_weight);
+    state.counters["warmup_continuous_ramp"] = 1;
+    state.counters["warmup_start_weight"] = 0;
+    state.counters["warmup_final_weight"] = 1;
+    state.counters["warmup_weight_scale"] = weight_scale;
     state.ResumeTiming();
   }
 }
 BENCHMARK(benchmarkRingHashLoadBalancerWarmupWeightUpdateSequence)
-    ->Args({100, 65536, 20, 10000, 10, 32})
-    ->Args({500, 65536, 20, 10000, 10, 32})
-    ->Args({500, 256000, 20, 10000, 10, 32})
+    ->Args({100, 65536, 20, 10000, 10, 1000})
+    ->Args({500, 65536, 20, 10000, 10, 1000})
+    ->Args({500, 256000, 20, 10000, 10, 1000})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& state) {
@@ -1419,7 +1434,7 @@ void benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& s
     const uint32_t epochs = state.range(2);
     const uint64_t keys_per_epoch = state.range(3);
     const uint32_t weighted_subset_percent = state.range(4);
-    const uint32_t max_weight = state.range(5);
+    const uint32_t weight_scale = state.range(5);
     const uint64_t weighted_hosts = weightedSubsetHostCount(num_hosts, weighted_subset_percent);
 
     MaglevTester tester(num_hosts, table_size);
@@ -1446,10 +1461,10 @@ void benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& s
 
     state.ResumeTiming();
     for (uint32_t epoch = 0; epoch < epochs; ++epoch) {
-      const uint32_t weight = warmupWeightForEpoch(epoch, epochs, max_weight);
+      const uint32_t weight = scaledWarmupWeightForEpoch(epoch, epochs, weight_scale);
 
       const auto update_start = std::chrono::steady_clock::now();
-      tester.updateWeightedHosts(weighted_subset_percent, weight);
+      tester.updateWeightedHosts(weighted_subset_percent, weight, 0, weight_scale);
       const auto update_end = std::chrono::steady_clock::now();
       update_ms_total +=
           std::chrono::duration<double, std::milli>(update_end - update_start).count();
@@ -1499,9 +1514,10 @@ void benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& s
       const double epoch_weighted_percent =
           100.0 * weighted_subset_hits / static_cast<double>(keys_per_epoch);
       weighted_subset_percent_total += epoch_weighted_percent;
-      target_error_percent_total +=
-          std::abs(epoch_weighted_percent -
-                   weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, weight));
+      target_error_percent_total += std::abs(
+          epoch_weighted_percent -
+          weightedSubsetGlobalTargetPercent(num_hosts, weighted_hosts, static_cast<double>(weight),
+                                            static_cast<double>(weight_scale)));
       const HitDistributionStats hit_stats = summarizeHitDistribution(hit_counter, num_hosts);
       cv_total += hit_stats.cv;
       max_over_avg_total += hit_stats.max_over_avg;
@@ -1509,22 +1525,24 @@ void benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence(::benchmark::State& s
     }
     state.PauseTiming();
 
-    recordSequenceStats(
-        state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, max_weight,
-        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total, changed_percent_total,
-        changed_percent_max, weighted_subset_percent_total, target_error_percent_total, cv_total,
-        max_over_avg_total, p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
-        min_slots_delta_abs_total, max_slots_delta_abs_total);
+    recordSequenceStats(state, num_hosts, epochs, keys_per_epoch, weighted_subset_percent, 1,
+                        WarmupRampPattern, weighted_hosts, update_ms_total, lookup_ms_total,
+                        changed_percent_total, changed_percent_max, weighted_subset_percent_total,
+                        target_error_percent_total, cv_total, max_over_avg_total,
+                        p99_over_avg_total, slot_shape_change_epochs, slots_delta_abs_total,
+                        min_slots_delta_abs_total, max_slots_delta_abs_total);
     state.counters["warmup_ramp"] = 1;
-    state.counters["warmup_start_weight"] = warmupWeightForEpoch(0, epochs, max_weight);
-    state.counters["warmup_final_weight"] = warmupWeightForEpoch(epochs - 1, epochs, max_weight);
+    state.counters["warmup_continuous_ramp"] = 1;
+    state.counters["warmup_start_weight"] = 0;
+    state.counters["warmup_final_weight"] = 1;
+    state.counters["warmup_weight_scale"] = weight_scale;
     state.ResumeTiming();
   }
 }
 BENCHMARK(benchmarkMaglevLoadBalancerWarmupWeightUpdateSequence)
-    ->Args({100, 65537, 20, 10000, 10, 32})
-    ->Args({500, 65537, 20, 10000, 10, 32})
-    ->Args({500, 262147, 20, 10000, 10, 32})
+    ->Args({100, 65537, 20, 10000, 10, 1000})
+    ->Args({500, 65537, 20, 10000, 10, 1000})
+    ->Args({500, 262147, 20, 10000, 10, 1000})
     ->Unit(::benchmark::kMillisecond);
 
 void benchmarkRingHashLoadBalancerWeightUpdateSequence(::benchmark::State& state) {
