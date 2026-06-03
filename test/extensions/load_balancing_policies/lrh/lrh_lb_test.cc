@@ -93,6 +93,18 @@ public:
     }
   }
 
+  bool containsHostPtr(const HostVector& hosts, const HostConstSharedPtr& host) {
+    if (host == nullptr) {
+      return false;
+    }
+    for (const auto& candidate : hosts) {
+      if (candidate.get() == host.get()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   HostConstSharedPtr choose(LoadBalancer& lb, uint64_t hash) {
     TestLoadBalancerContext context(hash);
     return lb.chooseHost(&context).host;
@@ -365,6 +377,52 @@ TEST_F(LrhLoadBalancerTest, BoundedLoadWeightOnlyRefreshUpdatesPublishedRingAndB
   EXPECT_GT(after_heavy, keys * 65 / 100);
 }
 
+TEST_F(LrhLoadBalancerTest, EquivalentNewHostsReuseTopologyWithoutMutatingExistingWorkerRing) {
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(8);
+
+  HostVector old_hosts = makeWeightedHosts({1, 1, 1, 1});
+  setHosts(old_hosts);
+  init();
+  auto old_worker_lb = workerLb();
+  ASSERT_EQ(1, lb_->stats().topology_cache_misses_.value());
+
+  const uint64_t key = 17;
+  const HostConstSharedPtr old_choice_before = chooseKey(*old_worker_lb, key);
+  ASSERT_TRUE(containsHostPtr(old_hosts, old_choice_before));
+
+  HostVector new_hosts = makeWeightedHosts({32, 1, 1, 1});
+  setHosts(new_hosts);
+  EXPECT_EQ(0, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(1, lb_->stats().topology_cache_hits_.value());
+  EXPECT_EQ(1, lb_->stats().topology_cache_misses_.value());
+
+  const HostConstSharedPtr old_choice_after = chooseKey(*old_worker_lb, key);
+  EXPECT_TRUE(containsHostPtr(old_hosts, old_choice_after));
+
+  auto new_worker_lb = workerLb();
+  const HostConstSharedPtr new_choice = chooseKey(*new_worker_lb, key);
+  EXPECT_TRUE(containsHostPtr(new_hosts, new_choice));
+  EXPECT_FALSE(containsHostPtr(old_hosts, new_choice));
+}
+
+TEST_F(LrhLoadBalancerTest, ReorderedSameHostsDoesNotUseWeightOnlyFastPath) {
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(8);
+
+  HostVector hosts = makeWeightedHosts({1, 1, 1, 1});
+  setHosts(hosts);
+  init();
+  ASSERT_EQ(1, lb_->stats().topology_cache_misses_.value());
+
+  mutateWeights(hosts, {32, 1, 1, 1});
+  setHosts({hosts[1], hosts[0], hosts[2], hosts[3]});
+
+  EXPECT_EQ(0, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(0, lb_->stats().topology_cache_hits_.value());
+  EXPECT_EQ(2, lb_->stats().topology_cache_misses_.value());
+}
+
 TEST_F(LrhLoadBalancerTest, DirectWeightTableUpdateMovesTrafficWithoutRefresh) {
   const uint64_t keys = 5000;
   const std::string heavy_address = "127.0.0.1:90";
@@ -458,6 +516,41 @@ TEST_F(LrhLoadBalancerTest, WindowDebiasedWeightsImproveCapacityFitBelowExposure
       << "direct=" << direct_heavy << " debiased=" << debiased_heavy;
 }
 
+TEST_F(LrhLoadBalancerTest, WindowDebiasedWeightOnlyRefreshUpdatesPublishedRing) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(4);
+  config_.set_weight_preprocessing(LrhLbProto::WINDOW_DEBIASED);
+
+  HostVector hosts = makeWeightedHosts({1, 1, 1, 1, 1, 1, 1, 1});
+  setHosts(hosts);
+  init();
+  auto lb = workerLb();
+
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*lb, key) == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
+  mutateWeights(hosts, {4, 1, 1, 1, 1, 1, 1, 1});
+  host_set_.runCallbacks({}, {});
+
+  EXPECT_EQ(1, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(1, lb_->stats().topology_cache_misses_.value());
+  EXPECT_EQ(0, lb_->stats().topology_cache_hits_.value());
+
+  uint64_t after_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*lb, key) == heavy_address) {
+      ++after_heavy;
+    }
+  }
+  EXPECT_GT(after_heavy, before_heavy * 2);
+}
+
 TEST_F(LrhLoadBalancerTest, HealthFilteringSkipsUnhealthyHosts) {
   HostVector hosts = {
       makeTestHost(info_, "tcp://127.0.0.1:90"), makeTestHost(info_, "tcp://127.0.0.1:91"),
@@ -473,6 +566,50 @@ TEST_F(LrhLoadBalancerTest, HealthFilteringSkipsUnhealthyHosts) {
   for (uint64_t key = 0; key < 500; ++key) {
     EXPECT_NE(hosts[3], choose(*lb, key));
   }
+}
+
+TEST_F(LrhLoadBalancerTest, HealthySubsetWeightOnlyRefreshUsesOnlyHealthyHosts) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
+  HostVector hosts = makeWeightedHosts({1, 1, 1, 1});
+  host_set_.hosts_ = hosts;
+  host_set_.healthy_hosts_ = {hosts[0], hosts[1], hosts[2]};
+  host_set_.runCallbacks({}, {});
+  config_.mutable_minimum_ring_size()->set_value(128);
+  config_.mutable_candidate_count()->set_value(8);
+
+  init();
+  auto lb = workerLb();
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const HostConstSharedPtr host = chooseKey(*lb, key);
+    ASSERT_NE(nullptr, host);
+    EXPECT_NE(hosts[3], host);
+    if (host->address()->asString() == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
+  mutateWeights(hosts, {32, 1, 1, 1});
+  host_set_.runCallbacks({}, {});
+  EXPECT_EQ(1, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(1, lb_->stats().topology_cache_misses_.value());
+
+  uint64_t after_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const HostConstSharedPtr host = chooseKey(*lb, key);
+    ASSERT_NE(nullptr, host);
+    EXPECT_NE(hosts[3], host);
+    if (host->address()->asString() == heavy_address) {
+      ++after_heavy;
+    }
+  }
+  EXPECT_GT(after_heavy, before_heavy * 2);
+
+  host_set_.healthy_hosts_ = hosts;
+  host_set_.runCallbacks({}, {});
+  EXPECT_EQ(1, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(2, lb_->stats().topology_cache_misses_.value());
 }
 
 TEST_F(LrhLoadBalancerTest, RawAndDeduplicatedCandidateWindowsCanDiffer) {
