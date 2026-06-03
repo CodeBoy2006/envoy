@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,10 +67,6 @@ ThreadAwareLoadBalancerBase::HashingLoadBalancerSharedPtr
 LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
                                     double min_normalized_weight,
                                     double /* max_normalized_weight */) {
-  // The production weight-only fast path is deliberately disabled for bounded-load LRH. Existing
-  // worker-local bounded wrappers hold their own normalized-weight maps; mutating the shared LRH
-  // ring underneath them would make the inner LRH choice and the overload bound disagree until
-  // workers replace their local LB instances.
   if (hash_balance_factor_ == 0) {
     for (auto it = cached_rings_.begin(); it != cached_rings_.end();) {
       auto cached_ring = it->lock();
@@ -83,6 +80,22 @@ LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized
         stats_.weight_only_updates_.inc();
         latest_ring_for_test_ = cached_ring;
         return cached_ring;
+      }
+      ++it;
+    }
+  } else {
+    for (auto it = cached_bounded_rings_.begin(); it != cached_bounded_rings_.end();) {
+      auto cached_bounded_ring = it->lock();
+      if (cached_bounded_ring == nullptr) {
+        it = cached_bounded_rings_.erase(it);
+        continue;
+      }
+
+      if (cached_bounded_ring->updateWeightsForSameHosts(normalized_host_weights,
+                                                         use_hostname_for_hashing_)) {
+        stats_.weight_only_updates_.inc();
+        latest_ring_for_test_ = cached_bounded_ring->ring();
+        return cached_bounded_ring;
       }
       ++it;
     }
@@ -102,8 +115,10 @@ LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized
     return lrh_lb;
   }
 
-  return std::make_shared<BoundedLoadHashingLoadBalancer>(
-      lrh_lb, std::move(normalized_host_weights), hash_balance_factor_);
+  auto bounded_lrh_lb =
+      std::make_shared<BoundedRing>(ring, normalized_host_weights, hash_balance_factor_);
+  cached_bounded_rings_.push_back(bounded_lrh_lb);
+  return bounded_lrh_lb;
 }
 
 LrhLoadBalancerStats LrhLoadBalancer::generateStats(Stats::Scope& scope) {
@@ -276,6 +291,13 @@ bool LrhLoadBalancer::Ring::updateWeightsForSameHosts(
   return true;
 }
 
+double LrhLoadBalancer::Ring::capacityWeightAtIndex(size_t host_index) const {
+  if (host_index >= host_states_.size()) {
+    return MinEffectiveWeight;
+  }
+  return host_states_[host_index]->capacity_weight_.load(std::memory_order_relaxed);
+}
+
 bool LrhLoadBalancer::Ring::sameHostsInOrder(
     const NormalizedHostWeightVector& normalized_host_weights) const {
   if (normalized_host_weights.size() != host_states_.size()) {
@@ -283,6 +305,135 @@ bool LrhLoadBalancer::Ring::sameHostsInOrder(
   }
   for (size_t i = 0; i < normalized_host_weights.size(); ++i) {
     if (normalized_host_weights[i].first != host_states_[i]->host_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+LrhLoadBalancer::BoundedRing::BoundedRing(RingSharedPtr ring,
+                                          const NormalizedHostWeightVector& normalized_host_weights,
+                                          uint32_t hash_balance_factor)
+    : ring_(std::move(ring)), hash_balance_factor_(hash_balance_factor) {
+  ASSERT(ring_ != nullptr);
+  ASSERT(hash_balance_factor > 0);
+  host_weights_.reserve(normalized_host_weights.size());
+  for (const auto& entry : normalized_host_weights) {
+    host_index_by_ptr_[entry.first] = host_weights_.size();
+    host_weights_.push_back(std::make_shared<HostWeightState>(entry.first));
+  }
+}
+
+HostSelectionResponse LrhLoadBalancer::BoundedRing::chooseHost(uint64_t hash,
+                                                               uint32_t attempt) const {
+  if (host_weights_.empty()) {
+    return {nullptr};
+  }
+
+  HostConstSharedPtr host =
+      LoadBalancer::onlyAllowSynchronousHostSelection(ring_->chooseHost(hash, attempt));
+  if (host == nullptr) {
+    return {nullptr};
+  }
+
+  double overload_factor = hostOverloadFactor(*host, normalizedWeightForHost(host));
+  if (overload_factor <= 1.0) {
+    ENVOY_LOG_MISC(debug, "LrhLoadBalancer::BoundedRing::chooseHost: selected host #{} (attempt:1)",
+                   host->address()->asString());
+    return host;
+  }
+
+  const uint32_t num_hosts = host_weights_.size();
+  auto host_index = std::vector<uint32_t>(num_hosts);
+  for (uint32_t i = 0; i < num_hosts; i++) {
+    host_index[i] = i;
+  }
+
+  const uint64_t seed = hash;
+  std::mt19937 random(seed);
+  auto uniform_int = [](std::mt19937& random, uint32_t k) -> uint32_t {
+    uint32_t x = k;
+    while (x >= k) {
+      x = random() / ((static_cast<uint64_t>(random.max()) + 1u) / k);
+    }
+    return x;
+  };
+
+  HostConstSharedPtr alt_host;
+  HostConstSharedPtr least_overloaded_host = host;
+  double least_overload_factor = overload_factor;
+  for (uint32_t i = 0; i < num_hosts; i++) {
+    const uint32_t j = uniform_int(random, num_hosts - i);
+    std::swap(host_index[i], host_index[i + j]);
+
+    const uint32_t k = host_index[i];
+    const auto& alt_host_state = *host_weights_[k];
+    alt_host = alt_host_state.host_;
+    if (alt_host == host) {
+      continue;
+    }
+
+    overload_factor = hostOverloadFactor(*alt_host, ring_->capacityWeightAtIndex(k));
+    if (overload_factor <= 1.0) {
+      ENVOY_LOG_MISC(debug,
+                     "LrhLoadBalancer::BoundedRing::chooseHost: selected host #{}:{} "
+                     "(attempt:{})",
+                     k, alt_host->address()->asString(), i + 2);
+      return alt_host;
+    }
+
+    if (least_overload_factor > overload_factor) {
+      least_overloaded_host = alt_host;
+      least_overload_factor = overload_factor;
+    }
+  }
+
+  return least_overloaded_host;
+}
+
+bool LrhLoadBalancer::BoundedRing::updateWeightsForSameHosts(
+    const NormalizedHostWeightVector& normalized_host_weights, bool use_hostname_for_hashing) {
+  if (!sameHostsInOrder(normalized_host_weights)) {
+    return false;
+  }
+  if (!ring_->updateWeightsForSameHosts(normalized_host_weights, use_hostname_for_hashing)) {
+    return false;
+  }
+  return true;
+}
+
+double LrhLoadBalancer::BoundedRing::hostOverloadFactor(const Host& host, double weight) const {
+  const uint32_t overall_active = host.cluster().trafficStats()->upstream_rq_active_.value();
+  const uint32_t host_active = host.stats().rq_active_.value();
+
+  const uint32_t total_slots = ((overall_active + 1) * hash_balance_factor_ + 99) / 100;
+  const uint32_t slots =
+      std::max(static_cast<uint32_t>(std::ceil(total_slots * weight)), static_cast<uint32_t>(1));
+
+  if (host_active > slots) {
+    ENVOY_LOG_MISC(debug,
+                   "LrhLoadBalancer::BoundedRing::chooseHost: host {} overloaded; "
+                   "overall_active {}, host_weight {}, host_active {} > slots {}",
+                   host.address()->asString(), overall_active, weight, host_active, slots);
+  }
+  return static_cast<double>(host_active) / slots;
+}
+
+double LrhLoadBalancer::BoundedRing::normalizedWeightForHost(const HostConstSharedPtr& host) const {
+  const auto it = host_index_by_ptr_.find(host);
+  if (it == host_index_by_ptr_.end()) {
+    return 1.0;
+  }
+  return ring_->capacityWeightAtIndex(it->second);
+}
+
+bool LrhLoadBalancer::BoundedRing::sameHostsInOrder(
+    const NormalizedHostWeightVector& normalized_host_weights) const {
+  if (normalized_host_weights.size() != host_weights_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < normalized_host_weights.size(); ++i) {
+    if (normalized_host_weights[i].first != host_weights_[i]->host_) {
       return false;
     }
   }

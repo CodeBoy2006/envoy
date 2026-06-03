@@ -330,7 +330,9 @@ TEST_F(LrhLoadBalancerTest, WeightOnlyHostSetRefreshUpdatesPublishedRing) {
   EXPECT_GT(after_heavy, keys * 65 / 100);
 }
 
-TEST_F(LrhLoadBalancerTest, BoundedLoadRefreshDoesNotMutatePublishedRingInPlace) {
+TEST_F(LrhLoadBalancerTest, BoundedLoadWeightOnlyRefreshUpdatesPublishedRingAndBounds) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
   config_.mutable_minimum_ring_size()->set_value(128);
   config_.mutable_candidate_count()->set_value(8);
   config_.mutable_consistent_hashing_lb_config()->mutable_hash_balance_factor()->set_value(150);
@@ -339,11 +341,28 @@ TEST_F(LrhLoadBalancerTest, BoundedLoadRefreshDoesNotMutatePublishedRingInPlace)
   setHosts(hosts);
   init();
 
+  auto lb = workerLb();
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*lb, key) == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
   mutateWeights(hosts, {32, 1, 1, 1});
   host_set_.runCallbacks({}, {});
 
-  EXPECT_EQ(0, lb_->stats().weight_only_updates_.value());
-  EXPECT_EQ(1, lb_->stats().topology_cache_hits_.value());
+  EXPECT_EQ(1, lb_->stats().weight_only_updates_.value());
+  EXPECT_EQ(0, lb_->stats().topology_cache_hits_.value());
+
+  uint64_t after_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    if (chooseKeyAddress(*lb, key) == heavy_address) {
+      ++after_heavy;
+    }
+  }
+  EXPECT_GT(after_heavy, before_heavy * 2);
+  EXPECT_GT(after_heavy, keys * 65 / 100);
 }
 
 TEST_F(LrhLoadBalancerTest, DirectWeightTableUpdateMovesTrafficWithoutRefresh) {

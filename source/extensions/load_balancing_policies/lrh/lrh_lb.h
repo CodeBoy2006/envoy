@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -101,6 +102,7 @@ private:
     size_t ringSizeForTest() const { return ring_->size(); }
     size_t candidateCountForTest() const { return candidate_count_; }
     TopologySharedPtr topology() const { return topology_; }
+    double capacityWeightAtIndex(size_t host_index) const;
     bool updateWeightsForSameHosts(const NormalizedHostWeightVector& normalized_host_weights,
                                    bool use_hostname_for_hashing);
     bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
@@ -150,6 +152,37 @@ private:
     const LrhLbProto::WeightPreprocessing weight_preprocessing_;
     LrhLoadBalancerStats& stats_;
   };
+  using RingSharedPtr = std::shared_ptr<Ring>;
+
+  class BoundedRing : public HashingLoadBalancer {
+  public:
+    BoundedRing(RingSharedPtr ring, const NormalizedHostWeightVector& normalized_host_weights,
+                uint32_t hash_balance_factor);
+
+    HostSelectionResponse chooseHost(uint64_t hash, uint32_t attempt) const override;
+
+    bool updateWeightsForSameHosts(const NormalizedHostWeightVector& normalized_host_weights,
+                                   bool use_hostname_for_hashing);
+    RingSharedPtr ring() const { return ring_; }
+
+  private:
+    struct HostWeightState {
+      explicit HostWeightState(HostConstSharedPtr host) : host_(std::move(host)) {}
+
+      HostConstSharedPtr host_;
+    };
+    using HostWeightStateSharedPtr = std::shared_ptr<HostWeightState>;
+
+    double hostOverloadFactor(const Host& host, double weight) const;
+    double normalizedWeightForHost(const HostConstSharedPtr& host) const;
+    bool sameHostsInOrder(const NormalizedHostWeightVector& normalized_host_weights) const;
+
+    RingSharedPtr ring_;
+    std::vector<HostWeightStateSharedPtr> host_weights_;
+    std::map<HostConstSharedPtr, size_t> host_index_by_ptr_;
+    const uint32_t hash_balance_factor_;
+  };
+  using BoundedRingSharedPtr = std::shared_ptr<BoundedRing>;
 
   // ThreadAwareLoadBalancerBase
   HashingLoadBalancerSharedPtr
@@ -167,6 +200,7 @@ private:
   const uint32_t hash_balance_factor_;
   Ring::TopologySharedPtr cached_topology_;
   std::vector<std::weak_ptr<Ring>> cached_rings_;
+  std::vector<std::weak_ptr<BoundedRing>> cached_bounded_rings_;
   std::weak_ptr<Ring> latest_ring_for_test_;
 };
 
