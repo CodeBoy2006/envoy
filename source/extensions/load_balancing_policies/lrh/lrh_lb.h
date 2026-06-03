@@ -40,7 +40,10 @@ public:
 /**
  * All LRH load balancer stats. @see stats_macros.h
  */
-#define ALL_LRH_LOAD_BALANCER_STATS(GAUGE)                                                         \
+#define ALL_LRH_LOAD_BALANCER_STATS(COUNTER, GAUGE)                                                \
+  COUNTER(topology_cache_hits)                                                                     \
+  COUNTER(topology_cache_misses)                                                                   \
+  COUNTER(weight_only_updates)                                                                     \
   GAUGE(max_hashes_per_host, Accumulate)                                                           \
   GAUGE(min_hashes_per_host, Accumulate)                                                           \
   GAUGE(size, Accumulate)
@@ -49,7 +52,7 @@ public:
  * Struct definition for all LRH load balancer stats. @see stats_macros.h
  */
 struct LrhLoadBalancerStats {
-  ALL_LRH_LOAD_BALANCER_STATS(GENERATE_GAUGE_STRUCT)
+  ALL_LRH_LOAD_BALANCER_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
 };
 
 /**
@@ -98,6 +101,8 @@ private:
     size_t ringSizeForTest() const { return ring_->size(); }
     size_t candidateCountForTest() const { return candidate_count_; }
     TopologySharedPtr topology() const { return topology_; }
+    bool updateWeightsForSameHosts(const NormalizedHostWeightVector& normalized_host_weights,
+                                   bool use_hostname_for_hashing);
     bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
     bool updateHostWeightsForTest(absl::Span<const std::pair<uint32_t, double>> weight_updates);
 
@@ -130,6 +135,8 @@ private:
                                            uint64_t min_ring_size, uint64_t max_ring_size);
     static bool topologyMatches(const Topology& topology,
                                 const std::vector<InitialHostState>& host_states);
+    bool sameHostsInOrder(const NormalizedHostWeightVector& normalized_host_weights) const;
+    void storeCapacityWeights(absl::Span<const double> capacity_weights);
     static double sanitizeWeight(double effective_weight);
     static double windowDebiasedWeight(double capacity_weight, double total_capacity_weight,
                                        size_t host_count, uint32_t candidate_count);
@@ -159,6 +166,7 @@ private:
   const LrhLbProto::WeightPreprocessing weight_preprocessing_;
   const uint32_t hash_balance_factor_;
   Ring::TopologySharedPtr cached_topology_;
+  std::vector<std::weak_ptr<Ring>> cached_rings_;
   std::weak_ptr<Ring> latest_ring_for_test_;
 };
 

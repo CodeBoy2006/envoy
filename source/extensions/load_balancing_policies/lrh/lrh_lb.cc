@@ -66,11 +66,34 @@ ThreadAwareLoadBalancerBase::HashingLoadBalancerSharedPtr
 LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
                                     double min_normalized_weight,
                                     double /* max_normalized_weight */) {
+  // The production weight-only fast path is deliberately disabled for bounded-load LRH. Existing
+  // worker-local bounded wrappers hold their own normalized-weight maps; mutating the shared LRH
+  // ring underneath them would make the inner LRH choice and the overload bound disagree until
+  // workers replace their local LB instances.
+  if (hash_balance_factor_ == 0) {
+    for (auto it = cached_rings_.begin(); it != cached_rings_.end();) {
+      auto cached_ring = it->lock();
+      if (cached_ring == nullptr) {
+        it = cached_rings_.erase(it);
+        continue;
+      }
+
+      if (cached_ring->updateWeightsForSameHosts(normalized_host_weights,
+                                                 use_hostname_for_hashing_)) {
+        stats_.weight_only_updates_.inc();
+        latest_ring_for_test_ = cached_ring;
+        return cached_ring;
+      }
+      ++it;
+    }
+  }
+
   auto ring = std::make_shared<Ring>(normalized_host_weights, min_normalized_weight, min_ring_size_,
                                      max_ring_size_, candidate_count_, deduplicate_hosts_,
                                      use_hostname_for_hashing_, weight_preprocessing_,
                                      cached_topology_, stats_);
   cached_topology_ = ring->topology();
+  cached_rings_.push_back(ring);
   latest_ring_for_test_ = ring;
 
   HashingLoadBalancerSharedPtr lrh_lb = ring;
@@ -84,7 +107,7 @@ LrhLoadBalancer::createLoadBalancer(const NormalizedHostWeightVector& normalized
 }
 
 LrhLoadBalancerStats LrhLoadBalancer::generateStats(Stats::Scope& scope) {
-  return {ALL_LRH_LOAD_BALANCER_STATS(POOL_GAUGE(scope))};
+  return {ALL_LRH_LOAD_BALANCER_STATS(POOL_COUNTER(scope), POOL_GAUGE(scope))};
 }
 
 bool LrhLoadBalancer::updateWeightsForTest(absl::Span<const double> capacity_weights_by_host) {
@@ -109,6 +132,9 @@ size_t LrhLoadBalancer::Ring::lowerBound(uint64_t hash) const {
 }
 
 double LrhLoadBalancer::Ring::sanitizeWeight(double effective_weight) {
+  if (!std::isfinite(effective_weight) || effective_weight <= 0.0) {
+    return MinEffectiveWeight;
+  }
   return std::max(effective_weight, MinEffectiveWeight);
 }
 
@@ -208,13 +234,7 @@ bool LrhLoadBalancer::Ring::updateWeightsForTest(
   if (capacity_weights_by_host.size() != host_states_.size()) {
     return false;
   }
-  double total_capacity_weight = 0.0;
-  for (size_t i = 0; i < capacity_weights_by_host.size(); ++i) {
-    const double capacity_weight = sanitizeWeight(capacity_weights_by_host[i]);
-    host_states_[i]->capacity_weight_.store(capacity_weight, std::memory_order_relaxed);
-    total_capacity_weight += capacity_weight;
-  }
-  total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
+  storeCapacityWeights(capacity_weights_by_host);
   return true;
 }
 
@@ -235,6 +255,48 @@ bool LrhLoadBalancer::Ring::updateHostWeightsForTest(
   }
   total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
   return true;
+}
+
+bool LrhLoadBalancer::Ring::updateWeightsForSameHosts(
+    const NormalizedHostWeightVector& normalized_host_weights, bool use_hostname_for_hashing) {
+  if (!sameHostsInOrder(normalized_host_weights)) {
+    return false;
+  }
+
+  absl::InlinedVector<double, 128> capacity_weights;
+  capacity_weights.reserve(normalized_host_weights.size());
+  for (const auto& entry : normalized_host_weights) {
+    const absl::string_view key_to_hash = hashKey(entry.first, use_hostname_for_hashing);
+    if (key_to_hash != topology_->host_keys_[capacity_weights.size()]) {
+      return false;
+    }
+    capacity_weights.push_back(entry.second);
+  }
+  storeCapacityWeights(capacity_weights);
+  return true;
+}
+
+bool LrhLoadBalancer::Ring::sameHostsInOrder(
+    const NormalizedHostWeightVector& normalized_host_weights) const {
+  if (normalized_host_weights.size() != host_states_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < normalized_host_weights.size(); ++i) {
+    if (normalized_host_weights[i].first != host_states_[i]->host_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void LrhLoadBalancer::Ring::storeCapacityWeights(absl::Span<const double> capacity_weights) {
+  double total_capacity_weight = 0.0;
+  for (size_t i = 0; i < capacity_weights.size(); ++i) {
+    const double capacity_weight = sanitizeWeight(capacity_weights[i]);
+    host_states_[i]->capacity_weight_.store(capacity_weight, std::memory_order_relaxed);
+    total_capacity_weight += capacity_weight;
+  }
+  total_capacity_weight_.store(sanitizeWeight(total_capacity_weight), std::memory_order_relaxed);
 }
 
 LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_weights,
@@ -266,9 +328,11 @@ LrhLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_host_we
 
   if (cached_topology != nullptr && topologyMatches(*cached_topology, initial_host_states)) {
     topology_ = std::move(cached_topology);
+    stats_.topology_cache_hits_.inc();
   } else {
     ENVOY_LOG(trace, "lrh: building ring topology");
     topology_ = buildTopology(initial_host_states, min_ring_size, max_ring_size);
+    stats_.topology_cache_misses_.inc();
   }
   ring_ = &topology_->ring_;
 
