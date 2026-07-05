@@ -1,0 +1,47 @@
+load(
+    "//bazel:envoy_build_system.bzl",
+    "envoy_package",
+)
+load(
+    "//test/extensions:extensions_build_system.bzl",
+    "envoy_extension_cc_test",
+)
+
+licenses(["notice"])  # Apache 2
+
+envoy_package()
+
+envoy_extension_cc_test(
+    name = "anchorflow_lb_test",
+    srcs = ["anchorflow_lb_test.cc"],
+    extension_names = ["envoy.load_balancing_policies.anchorflow"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/upstream:load_balancer_context_base_lib",
+        "//source/extensions/load_balancing_policies/anchorflow:anchorflow_lb_lib",
+        "//test/common/upstream:utility_lib",
+        "//test/mocks:common_lib",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "//test/mocks/upstream:host_set_mocks",
+        "//test/mocks/upstream:priority_set_mocks",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:test_runtime_lib",
+        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_cc_test(
+    name = "config_test",
+    srcs = ["config_test.cc"],
+    extension_names = ["envoy.load_balancing_policies.anchorflow"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/load_balancing_policies/anchorflow:config",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "//test/mocks/upstream:priority_set_mocks",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/load_balancing_policies/anchorflow/v3:pkg_cc_proto",
+    ],
+)

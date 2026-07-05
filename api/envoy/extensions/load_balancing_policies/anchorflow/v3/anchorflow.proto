@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package envoy.extensions.load_balancing_policies.anchorflow.v3;
+
+import "envoy/extensions/load_balancing_policies/common/v3/common.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.load_balancing_policies.anchorflow.v3";
+option java_outer_classname = "AnchorflowProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/anchorflow/v3;anchorflowv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: AnchorFlow Load Balancing Policy]
+// [#extension: envoy.load_balancing_policies.anchorflow]
+
+// AnchorFlow keeps a stable AnchorHash-over-tokens topology and applies
+// capacity changes as a lookup-time residual flow from surplus anchor owners to
+// deficit receivers. Receiver sampling is stable across capacity epochs by
+// default: the same request hash, donor, and receiver distribution produce the
+// same receiver without rebuilding token ownership.
+// [#next-free-field: 7]
+message AnchorFlow {
+  // Number of equal-mass tokens assigned to each host in the stable topology.
+  // Defaults to 64.
+  google.protobuf.UInt32Value tokens_per_host = 1
+      [(validate.rules).uint32 = {lte: 4096 gte: 1}];
+
+  // AnchorHash anchor bucket count. If unset, Envoy uses the active token count.
+  // If set, it must be at least hosts * tokens_per_host.
+  google.protobuf.UInt64Value anchor_buckets = 2 [(validate.rules).uint64 = {lte: 8388608 gte: 1}];
+
+  // Common configuration for hashing-based load balancing policies.
+  common.v3.ConsistentHashingLbConfig consistent_hashing_lb_config = 3;
+
+  // Enable locality weighted load balancing for AnchorFlow explicitly.
+  common.v3.LocalityLbConfig.LocalityWeightedLbConfig locality_weighted_lb_config = 4;
+
+  // Stable movement-threshold hash seed. Defaults to an implementation-defined constant.
+  google.protobuf.UInt64Value movement_seed = 5;
+
+  // Stable residual receiver hash seed. Defaults to an implementation-defined constant.
+  google.protobuf.UInt64Value receiver_seed = 6;
+}
