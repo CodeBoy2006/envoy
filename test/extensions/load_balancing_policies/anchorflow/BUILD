@@ -1,5 +1,7 @@
 load(
     "//bazel:envoy_build_system.bzl",
+    "envoy_benchmark_test",
+    "envoy_cc_benchmark_binary",
     "envoy_package",
 )
 load(
@@ -44,4 +46,20 @@ envoy_extension_cc_test(
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/load_balancing_policies/anchorflow/v3:pkg_cc_proto",
     ],
+)
+
+envoy_cc_benchmark_binary(
+    name = "anchorflow_lb_benchmark",
+    srcs = ["anchorflow_lb_benchmark.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/load_balancing_policies/anchorflow:anchorflow_lb_lib",
+        "//test/extensions/load_balancing_policies/common:benchmark_base_tester_lib",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "anchorflow_lb_benchmark_test",
+    timeout = "long",
+    benchmark_binary = "anchorflow_lb_benchmark",
 )
