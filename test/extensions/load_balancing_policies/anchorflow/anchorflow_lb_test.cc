@@ -218,6 +218,64 @@ TEST_F(AnchorFlowLoadBalancerTest, StableReceiverSeedKeepsReceiverChoiceAcrossEp
   EXPECT_GT(stable_receiver_checks, 1000);
 }
 
+TEST_F(AnchorFlowLoadBalancerTest, DirectCapacityStateUpdateMovesTrafficWithoutRefresh) {
+  const uint64_t keys = 5000;
+  const std::string heavy_address = "127.0.0.1:90";
+  config_.mutable_tokens_per_host()->set_value(32);
+
+  setHosts(makeWeightedHosts({1, 1, 1, 1}));
+  init();
+  const uint64_t tokens = lb_->stats().tokens_.value();
+  const uint64_t anchor_buckets = lb_->stats().anchor_buckets_.value();
+  const double base_weight = 1.0 / 4.0;
+
+  auto lb = workerLb();
+  std::vector<std::string> before_assignments;
+  before_assignments.reserve(keys);
+  uint64_t before_heavy = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*lb, key);
+    before_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++before_heavy;
+    }
+  }
+
+  const std::vector<double> direct_weights{32.0 * base_weight, base_weight, base_weight,
+                                           base_weight};
+  ASSERT_TRUE(lb_->updateWeightsForTest(direct_weights));
+  EXPECT_EQ(tokens, lb_->stats().tokens_.value());
+  EXPECT_EQ(anchor_buckets, lb_->stats().anchor_buckets_.value());
+
+  std::vector<std::string> after_assignments;
+  after_assignments.reserve(keys);
+  uint64_t after_heavy = 0;
+  uint64_t changed = 0;
+  for (uint64_t key = 0; key < keys; ++key) {
+    const std::string address = chooseKeyAddress(*lb, key);
+    after_assignments.push_back(address);
+    if (address == heavy_address) {
+      ++after_heavy;
+    }
+    if (address != before_assignments[key]) {
+      ++changed;
+    }
+  }
+
+  EXPECT_GT(after_heavy, before_heavy * 2);
+  EXPECT_GT(after_heavy, keys * 70 / 100);
+  EXPECT_GT(changed, keys / 4);
+  EXPECT_LT(changed, keys);
+
+  const std::vector<double> scaled_weights{320.0 * base_weight, 10.0 * base_weight,
+                                           10.0 * base_weight, 10.0 * base_weight};
+  ASSERT_TRUE(lb_->updateWeightsForTest(scaled_weights));
+  for (uint64_t key = 0; key < keys; ++key) {
+    EXPECT_EQ(after_assignments[key], chooseKeyAddress(*lb, key))
+        << "scaled direct weights changed winner for key " << key;
+  }
+}
+
 } // namespace
 } // namespace Upstream
 } // namespace Envoy

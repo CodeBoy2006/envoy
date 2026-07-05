@@ -19,6 +19,7 @@
 #include "source/extensions/load_balancing_policies/common/thread_aware_lb_impl.h"
 
 #include "absl/types/optional.h"
+#include "absl/types/span.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -54,6 +55,7 @@ public:
   const AnchorFlowLoadBalancerStats& stats() const { return stats_; }
 
   static AnchorFlowLoadBalancerStats generateStats(Stats::Scope& scope);
+  bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
 
   static constexpr uint32_t DefaultTokensPerHost = 64;
   static constexpr uint32_t MaxTokensPerHost = 4096;
@@ -77,6 +79,7 @@ private:
     TopologySharedPtr topology() const { return topology_; }
     size_t tokenCountForTest() const;
     size_t anchorBucketCountForTest() const;
+    bool updateWeightsForTest(absl::Span<const double> capacity_weights_by_host);
 
   private:
     class AnchorHashMap {
@@ -101,12 +104,15 @@ private:
     };
 
     struct HostState {
-      HostState(HostConstSharedPtr host, std::string hash_key, double target_weight)
-          : host_(std::move(host)), hash_key_(std::move(hash_key)), target_weight_(target_weight) {}
+      HostState(HostConstSharedPtr host, std::string hash_key, double target_weight,
+                uint32_t original_host_index)
+          : host_(std::move(host)), hash_key_(std::move(hash_key)), target_weight_(target_weight),
+            original_host_index_(original_host_index) {}
 
       HostConstSharedPtr host_;
       std::string hash_key_;
       double target_weight_;
+      uint32_t original_host_index_;
     };
 
     struct CapacityState {
@@ -164,6 +170,7 @@ private:
   const uint64_t receiver_seed_;
   const uint32_t hash_balance_factor_;
   Table::TopologySharedPtr cached_topology_;
+  std::weak_ptr<Table> latest_table_for_test_;
 };
 
 } // namespace Upstream

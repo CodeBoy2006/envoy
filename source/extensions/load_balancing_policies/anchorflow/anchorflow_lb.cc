@@ -68,6 +68,7 @@ AnchorFlowLoadBalancer::createLoadBalancer(
                                        use_hostname_for_hashing_, movement_seed_, receiver_seed_,
                                        cached_topology_, stats_);
   cached_topology_ = table->topology();
+  latest_table_for_test_ = table;
 
   HashingLoadBalancerSharedPtr anchorflow_lb = table;
   if (hash_balance_factor_ == 0) {
@@ -80,6 +81,12 @@ AnchorFlowLoadBalancer::createLoadBalancer(
 
 AnchorFlowLoadBalancerStats AnchorFlowLoadBalancer::generateStats(Stats::Scope& scope) {
   return {ALL_ANCHORFLOW_LOAD_BALANCER_STATS(POOL_COUNTER(scope), POOL_GAUGE(scope))};
+}
+
+bool AnchorFlowLoadBalancer::updateWeightsForTest(
+    absl::Span<const double> capacity_weights_by_host) {
+  auto table = latest_table_for_test_.lock();
+  return table != nullptr && table->updateWeightsForTest(capacity_weights_by_host);
 }
 
 AnchorFlowLoadBalancer::Table::AnchorHashMap::AnchorHashMap(uint32_t token_count,
@@ -139,10 +146,12 @@ AnchorFlowLoadBalancer::Table::sortedHostStates(
     bool use_hostname_for_hashing) const {
   std::vector<HostState> host_states;
   host_states.reserve(normalized_host_weights.size());
+  uint32_t original_host_index = 0;
   for (const auto& entry : normalized_host_weights) {
     const absl::string_view key_to_hash = hashKey(entry.first, use_hostname_for_hashing);
     ASSERT(!key_to_hash.empty());
-    host_states.emplace_back(entry.first, std::string(key_to_hash), entry.second);
+    host_states.emplace_back(entry.first, std::string(key_to_hash), entry.second,
+                             original_host_index++);
   }
 
   std::sort(host_states.begin(), host_states.end(), [](const HostState& lhs, const HostState& rhs) {
@@ -302,6 +311,22 @@ size_t AnchorFlowLoadBalancer::Table::tokenCountForTest() const {
 
 size_t AnchorFlowLoadBalancer::Table::anchorBucketCountForTest() const {
   return topology_->anchor_.anchorLen();
+}
+
+bool AnchorFlowLoadBalancer::Table::updateWeightsForTest(
+    absl::Span<const double> capacity_weights_by_host) {
+  if (capacity_weights_by_host.size() != host_states_.size()) {
+    return false;
+  }
+
+  for (auto& host_state : host_states_) {
+    if (host_state.original_host_index_ >= capacity_weights_by_host.size()) {
+      return false;
+    }
+    host_state.target_weight_ = capacity_weights_by_host[host_state.original_host_index_];
+  }
+  capacity_ = buildCapacityState(*topology_, host_states_);
+  return true;
 }
 
 HostSelectionResponse AnchorFlowLoadBalancer::Table::chooseHost(uint64_t hash,
